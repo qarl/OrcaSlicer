@@ -1,0 +1,56 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# Three instances of one 30mm cube prototype, with NON-translation transforms
+# (rotation, non-uniform scale) so a wrong row-vector -> column-vector transpose in the
+# importer diverges from the trusted flatten path. Used by tests/libslic3r/test_usd.cpp.
+
+def "Prototypes"
+{
+    class Xform "Proto"
+    {
+        def Mesh "Cube"
+        {
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7]
+            point3f[] points = [(0, 0, 0), (30, 0, 0), (30, 30, 0), (0, 30, 0), (0, 0, 30), (30, 0, 30), (30, 30, 30), (0, 30, 30)]
+            uniform token subdivisionScheme = "none"
+        }
+    }
+}
+
+def "Root"
+{
+    def Xform "inst_a" (
+        prepend inherits = </Prototypes/Proto>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "inst_b" (
+        prepend inherits = </Prototypes/Proto>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (100, 0, 0)
+        float xformOp:rotateZ = 37
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateZ"]
+    }
+
+    def Xform "inst_c" (
+        prepend inherits = </Prototypes/Proto>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (0, 100, 0)
+        float xformOp:rotateY = 25
+        double3 xformOp:scale = (2, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateY", "xformOp:scale"]
+    }
+}

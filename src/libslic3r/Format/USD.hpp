@@ -22,7 +22,7 @@ class Model;
 // summary reaches the log alone.
 extern bool load_usd(const char *path, TriangleMesh *meshptr, std::string &message);
 extern bool load_usd(const char *path, Model *model, std::string &message,
-                     const char *object_name = nullptr);
+                     const char *object_name = nullptr, bool amplify = true);
 
 }; // namespace Slic3r
 

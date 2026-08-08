@@ -18,6 +18,7 @@
 #include "enum_bitmask.hpp"
 #include "TextConfiguration.hpp"
 #include "EmbossShape.hpp"
+#include "PrintMan/PrintManScene.hpp"
 #include "TriangleSelector.hpp"
 
 //BBS: add bbs 3mf
@@ -896,7 +897,13 @@ public:
 
     // Is set only when volume is Embossed Shape
     // Contain 2d information about embossed shape to be editabled
-    std::optional<EmbossShape> emboss_shape; 
+    std::optional<EmbossShape> emboss_shape;
+
+    // Set only on a PrintMan amplified volume: the parametric scene (prototypes + placements)
+    // carried beside the baked envelope mesh, sliced through the amplification engine instead of
+    // the mesh. Not yet serialized -- undo/redo and 3MF reload fall back to slicing the envelope
+    // (exact for instancing, where the envelope is the true bake). See src/libslic3r/PrintMan/.
+    std::optional<PrintMan::PrintManScene> printman_scene;
 
     // A parent object owning this modifier volume.
     ModelObject*        get_object() const { return this->object; }
@@ -1116,7 +1123,7 @@ private:
         name(other.name), source(other.source), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
         config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         supported_facets(other.supported_facets), seam_facets(other.seam_facets), mmu_segmentation_facets(other.mmu_segmentation_facets),
-        fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
+        fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape), printman_scene(other.printman_scene)
     {
 		assert(this->id().valid()); 
         assert(this->config.id().valid()); 
@@ -1139,7 +1146,7 @@ private:
     // Providing a new mesh, therefore this volume will get a new unique ID assigned.
     ModelVolume(ModelObject *object, const ModelVolume &other, TriangleMesh &&mesh) :
         name(other.name), source(other.source), config(other.config), object(object), m_mesh(new TriangleMesh(std::move(mesh))), m_type(other.m_type), m_transformation(other.m_transformation),
-        cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
+        cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape), printman_scene(other.printman_scene)
     {
 		assert(this->id().valid()); 
         assert(this->config.id().valid()); 
