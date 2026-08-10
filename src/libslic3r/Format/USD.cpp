@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/PrintMan/PrintManScene.hpp"
 #include "USD.hpp"
 
 #ifdef _WIN32
@@ -658,6 +660,185 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
     return true;
 }
 
+// --- PrintMan instancing: build a scene, not a flattened pile of copies ---------------
+
+// Convert a USD GfMatrix4d (row-vector) to a column-vector Eigen Transform3d: the plain
+// transpose, since USD keeps translation in row 3 and Eigen in column 3.
+Transform3d gf_to_transform(const GfMatrix4d &m)
+{
+    Transform3d t;
+    for (int i = 0; i < 4; ++ i)
+        for (int j = 0; j < 4; ++ j)
+            t.matrix()(i, j) = m[j][i];
+    return t;
+}
+
+// The stage's world map: uniform mm scale plus the Y-up->Z-up swap (x,y,z)->(x,-z,y) when
+// the stage is Y-up. Folded into each placement, so prototypes stay in their local frame.
+Transform3d stage_root(double scale, bool y_up)
+{
+    Transform3d root = Transform3d::Identity();
+    if (y_up) {
+        Eigen::Matrix3d swap;
+        swap << 1, 0, 0,
+                0, 0, -1,
+                0, 1, 0;
+        root.linear() = swap;
+    }
+    root.linear() *= scale;
+    return root;
+}
+
+// Read a mesh prim's points as authored (prototype-local), fan-triangulated. leftHanded winding
+// is honoured; a mirror (det<0) is left to the placement, flipped per-placement in slice_scene.
+// False (with a tally) when the prim has no usable printable geometry.
+bool read_prototype_mesh(const UsdGeomMesh &mesh, UsdTimeCode when,
+                         SkipCounts &skipped, indexed_triangle_set &out)
+{
+    VtVec3fArray points;
+    VtIntArray   counts, indices;
+    if (!mesh.GetPointsAttr().Get(&points, when) ||
+        !mesh.GetFaceVertexCountsAttr().Get(&counts, when) ||
+        !mesh.GetFaceVertexIndicesAttr().Get(&indices, when) ||
+        points.empty() || counts.empty()) {
+        ++ skipped.no_data;
+        return false;
+    }
+    TfToken orientation = UsdGeomTokens->rightHanded;
+    mesh.GetOrientationAttr().Get(&orientation, when);
+    const bool flip = (orientation == UsdGeomTokens->leftHanded);
+
+    out.vertices.clear();
+    out.vertices.reserve(points.size());
+    for (const GfVec3f &p : points)
+        out.vertices.emplace_back(float(p[0]), float(p[1]), float(p[2]));   // authored local
+
+    out.indices.clear();
+    size_t cursor = 0;
+    for (int n : counts) {
+        if (n < 3 || cursor + size_t(n) > indices.size()) {
+            ++ skipped.bad_topology;
+            return false;
+        }
+        for (int k = 1; k + 1 < n; ++ k) {
+            int a = indices[cursor], b = indices[cursor + k], c = indices[cursor + k + 1];
+            if (flip) std::swap(b, c);
+            if (a < 0 || b < 0 || c < 0 ||
+                size_t(a) >= points.size() || size_t(b) >= points.size() ||
+                size_t(c) >= points.size()) {
+                ++ skipped.bad_topology;
+                return false;
+            }
+            out.indices.emplace_back(a, b, c);
+        }
+        cursor += size_t(n);
+    }
+    if (out.indices.size() < 2) {
+        ++ skipped.degenerate;
+        return false;
+    }
+    return true;
+}
+
+// Build a PrintManScene from a stage's instanceable prims: dedup prototypes by prim-in-prototype
+// path, read each once in local space, one placement per instance proxy
+// (root * transpose(local_to_world)). Left empty when the stage carries no instancing.
+void build_instance_scene(const UsdStageRefPtr &stage, UsdTimeCode when,
+                          const Transform3d &root, SkipCounts &skipped,
+                          PrintMan::PrintManScene &scene)
+{
+    std::map<std::string, int> proto_index;
+    UsdGeomXformCache xf(when);
+    UsdPrimRange range = UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies());
+    for (const UsdPrim &prim : range) {
+        if (!prim.IsInstanceProxy())
+            continue;
+        UsdGeomMesh mesh(prim);
+        if (!mesh || !is_renderable(prim, when, skipped))
+            continue;
+        const std::string key = prim.GetPrimInPrototype().GetPath().GetString();
+        int idx;
+        auto found = proto_index.find(key);
+        if (found == proto_index.end()) {
+            indexed_triangle_set proto;
+            if (!read_prototype_mesh(mesh, when, skipped, proto))
+                continue;
+            idx = int(scene.prototypes.size());
+            scene.prototypes.push_back(std::move(proto));
+            proto_index.emplace(key, idx);
+        } else {
+            idx = found->second;
+        }
+        PrintMan::Placement place;
+        place.prototype = idx;
+        place.xform     = root * gf_to_transform(xf.GetLocalToWorldTransform(prim));
+        scene.placements.push_back(place);
+    }
+}
+
+// Reopen the stage (read_stage already validated it) to extract instancing as a scene.
+// Returns false only on an open/plugin failure.
+bool build_scene_from_path(const char *path, PrintMan::PrintManScene &scene)
+{
+    if (!register_usd_plugins())
+        return false;
+    UsdStageRefPtr stage = UsdStage::Open(path);
+    if (!stage)
+        return false;
+    const Transform3d root = stage_root(mm_per_unit(stage),
+                                        UsdGeomGetStageUpAxis(stage) == UsdGeomTokens->y);
+    SkipCounts skipped;
+    build_instance_scene(stage, read_time(stage), root, skipped, scene);
+    return true;
+}
+
+// A solid axis-aligned box spanning [lo, hi] (8 verts, 12 triangles).
+indexed_triangle_set box_its(const Vec3f &lo, const Vec3f &hi)
+{
+    indexed_triangle_set b;
+    b.vertices = {
+        Vec3f(lo.x(), lo.y(), lo.z()), Vec3f(hi.x(), lo.y(), lo.z()),
+        Vec3f(hi.x(), hi.y(), lo.z()), Vec3f(lo.x(), hi.y(), lo.z()),
+        Vec3f(lo.x(), lo.y(), hi.z()), Vec3f(hi.x(), lo.y(), hi.z()),
+        Vec3f(hi.x(), hi.y(), hi.z()), Vec3f(lo.x(), hi.y(), hi.z()),
+    };
+    const int f[12][3] = {
+        {0, 3, 2}, {0, 2, 1}, {4, 5, 6}, {4, 6, 7},
+        {0, 1, 5}, {0, 5, 4}, {1, 2, 6}, {1, 6, 5},
+        {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7},
+    };
+    for (const auto &t : f)
+        b.indices.emplace_back(t[0], t[1], t[2]);
+    return b;
+}
+
+// One proxy box per placement -- each instance's EXACT world AABB, merged into one mesh. The
+// viewport shows the arrangement (and arrange/bed read it) while the engine slices the real
+// scene. It must be the exact vertex AABB, not a box-corner over-estimate: a corner box dips
+// below a tilted instance's true geometry, dropping the object bbox below the real lowest point
+// so ensure_on_bed floats it off the bed (empty first layer).
+indexed_triangle_set scene_proxy_boxes(const PrintMan::PrintManScene &scene)
+{
+    const double inf = std::numeric_limits<double>::infinity();
+    indexed_triangle_set merged;
+    for (const PrintMan::Placement &pl : scene.placements) {
+        if (pl.prototype < 0 || size_t(pl.prototype) >= scene.prototypes.size()) continue;
+        const indexed_triangle_set &proto = scene.prototypes[pl.prototype];
+        if (proto.vertices.empty()) continue;
+        Vec3d lo = Vec3d::Constant(inf), hi = Vec3d::Constant(-inf);
+        for (const stl_vertex &v : proto.vertices) {
+            const Vec3d w = pl.xform * v.cast<double>();
+            lo = lo.cwiseMin(w); hi = hi.cwiseMax(w);
+        }
+        const indexed_triangle_set b = box_its(lo.cast<float>(), hi.cast<float>());
+        const int base = int(merged.vertices.size());
+        merged.vertices.insert(merged.vertices.end(), b.vertices.begin(), b.vertices.end());
+        for (const stl_triangle_vertex_indices &t : b.indices)
+            merged.indices.emplace_back(t[0] + base, t[1] + base, t[2] + base);
+    }
+    return merged;
+}
+
 } // namespace
 
 // Merges the whole stage into one mesh. Kept for callers that want geometry
@@ -682,12 +863,8 @@ bool load_usd(const char *path, TriangleMesh *meshptr, std::string &message)
 // One ModelVolume per mesh prim, following Format/STEP.cpp -- a stage's parts
 // stay separately selectable, with their own settings, instead of arriving as
 // one indivisible lump.
-bool load_usd(const char *path, Model *model, std::string &message, const char *object_name_in)
+bool load_usd(const char *path, Model *model, std::string &message, const char *object_name_in, bool amplify)
 {
-    std::vector<NamedMesh> meshes;
-    if (!read_stage(path, meshes, message))
-        return false;
-
     std::string object_name;
     if (object_name_in == nullptr) {
         const char *last_slash = strrchr(path, DIR_SEPARATOR);
@@ -695,17 +872,54 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
     } else
         object_name.assign(object_name_in);
 
+    // PrintMan amplification: an instanced stage becomes ONE volume carrying the scene beside a
+    // proxy bounding-box envelope -- the N-instance geometry is never materialized, so peak
+    // memory stays bounded and slice_volume amplifies the scene lazily. amplify=false and
+    // non-instanced stages take the flatten path below (tests slice with amplify=false as the
+    // trusted transform reference). A stage mixing instances with standalone geometry imports
+    // only the instances.
+    if (amplify) {
+        PrintMan::PrintManScene scene;
+        if (build_scene_from_path(path, scene) && ! scene.placements.empty()) {
+            ModelObject *object = model->add_object();
+            object->name       = object_name;
+            object->input_file = path;
+
+            ModelVolume *volume = object->add_volume(TriangleMesh(scene_proxy_boxes(scene)));
+            volume->name              = object_name;
+            volume->source.input_file = path;
+            volume->source.object_idx = (int) model->objects.size() - 1;
+            volume->source.volume_idx = 0;
+            // add_volume centres the envelope and compensates in get_matrix(); express the scene
+            // in that same centred frame (-mesh_offset), so the +off in get_matrix and the -off
+            // here cancel instead of double-shifting params.trafo * get_matrix().
+            const Vec3d off = volume->source.mesh_offset;
+            for (PrintMan::Placement &pl : scene.placements) {
+                Transform3d shift = Transform3d::Identity();
+                shift.translate(-off);
+                pl.xform = shift * pl.xform;
+            }
+            volume->printman_scene = std::move(scene);
+            return true;
+        }
+    }
+
+    // Non-instanced stage (or amplify=false): one ModelVolume per mesh prim.
+    std::vector<NamedMesh> meshes;
+    if (! read_stage(path, meshes, message))
+        return false;
+
     ModelObject *object = model->add_object();
-    object->name             = object_name;
-    object->input_file       = path;
+    object->name       = object_name;
+    object->input_file = path;
 
     for (NamedMesh &m : meshes) {
         ModelVolume *volume = object->add_volume(TriangleMesh(std::move(m.its)));
         // The prim path, so a volume in the UI can be traced back to the stage.
-        volume->name                 = m.name;
-        volume->source.input_file    = path;
-        volume->source.object_idx    = (int) model->objects.size() - 1;
-        volume->source.volume_idx    = (int) object->volumes.size() - 1;
+        volume->name              = m.name;
+        volume->source.input_file = path;
+        volume->source.object_idx = (int) model->objects.size() - 1;
+        volume->source.volume_idx = (int) object->volumes.size() - 1;
     }
 
     return true;

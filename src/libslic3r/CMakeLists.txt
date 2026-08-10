@@ -480,6 +480,9 @@ set(lisbslic3r_sources
     GCode/ToolOrderUtils.cpp
     FlushVolPredictor.hpp
     FlushVolPredictor.cpp
+    PrintMan/PrintManScene.hpp
+    PrintMan/Engine.hpp
+    PrintMan/Engine.cpp
 )
 
 if (APPLE)

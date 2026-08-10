@@ -12,6 +12,7 @@
 //BBS
 #include "ShortestPath.hpp"
 #include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
+#include "PrintMan/Engine.hpp"
 
 //! macro used to mark string used at localization, return same string
 #define L(s) Slic3r::I18N::translate(s)
@@ -78,18 +79,31 @@ static std::vector<ExPolygons> slice_volume(
     const ModelVolume             &volume,
     const std::vector<float>      &zs,
     const MeshSlicingParamsEx     &params,
-    const std::function<void()>   &throw_on_cancel_callback)
+    const std::function<void()>   &throw_on_cancel_callback,
+    const std::function<void(size_t, size_t)> &report_progress = {})
 {
     std::vector<ExPolygons> layers;
     if (! zs.empty()) {
-        indexed_triangle_set its = volume.mesh().its;
-        if (its.indices.size() > 0) {
+        if (volume.printman_scene) {
+            // Amplified PrintMan volume: slice the parametric scene through the engine instead
+            // of the envelope mesh, never materializing the instanced geometry. Same params as
+            // the mesh path, trafo composed with get_matrix(); slice_scene folds each placement
+            // (with its det<0 winding flip) into the transform and threads the object's slicing
+            // params to every placement.
             MeshSlicingParamsEx params2 { params };
-            params2.trafo = params2.trafo * volume.get_matrix();
-            if (params2.trafo.rotation().determinant() < 0.)
-                its_flip_triangles(its);
-            layers = slice_mesh_ex(its, zs, params2, throw_on_cancel_callback);
+            params2.trafo = params.trafo * volume.get_matrix();
+            layers = PrintMan::slice_scene(*volume.printman_scene, params2, zs, throw_on_cancel_callback, report_progress);
             throw_on_cancel_callback();
+        } else {
+            indexed_triangle_set its = volume.mesh().its;
+            if (its.indices.size() > 0) {
+                MeshSlicingParamsEx params2 { params };
+                params2.trafo = params2.trafo * volume.get_matrix();
+                if (params2.trafo.rotation().determinant() < 0.)
+                    its_flip_triangles(its);
+                layers = slice_mesh_ex(its, zs, params2, throw_on_cancel_callback);
+                throw_on_cancel_callback();
+            }
         }
     }
     return layers;
@@ -102,13 +116,14 @@ static std::vector<ExPolygons> slice_volume(
     const std::vector<float>                    &z,
     const std::vector<t_layer_height_range>     &ranges,
     const MeshSlicingParamsEx                   &params,
-    const std::function<void()>                 &throw_on_cancel_callback)
+    const std::function<void()>                 &throw_on_cancel_callback,
+    const std::function<void(size_t, size_t)>   &report_progress = {})
 {
     std::vector<ExPolygons> out;
     if (! z.empty() && ! ranges.empty()) {
         if (ranges.size() == 1 && z.front() >= ranges.front().first && z.back() < ranges.front().second) {
             // All layers fit into a single range.
-            out = slice_volume(volume, z, params, throw_on_cancel_callback);
+            out = slice_volume(volume, z, params, throw_on_cancel_callback, report_progress);
         } else {
             std::vector<float>                     z_filtered;
             std::vector<std::pair<size_t, size_t>> n_filtered;
@@ -124,7 +139,7 @@ static std::vector<ExPolygons> slice_volume(
                     n_filtered.emplace_back(std::make_pair(first, i));
             }
             if (! n_filtered.empty()) {
-                std::vector<ExPolygons> layers = slice_volume(volume, z_filtered, params, throw_on_cancel_callback);
+                std::vector<ExPolygons> layers = slice_volume(volume, z_filtered, params, throw_on_cancel_callback, report_progress);
                 out.assign(z.size(), ExPolygons());
                 i = 0;
                 for (const std::pair<size_t, size_t> &span : n_filtered)
@@ -152,7 +167,8 @@ static std::vector<VolumeSlices> slice_volumes_inner(
     ModelVolumePtrs                                           model_volumes,
     const std::vector<PrintObjectRegions::LayerRangeRegions> &layer_ranges,
     const std::vector<float>                                 &zs,
-    const std::function<void()>                              &throw_on_cancel_callback)
+    const std::function<void()>                              &throw_on_cancel_callback,
+    const std::function<void(size_t, size_t)>                &report_progress = {})
 {
     model_volumes_sort_by_id(model_volumes);
 
@@ -206,7 +222,7 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                     }
                     out.push_back({
                         model_volume->id(),
-                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback)
+                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback, report_progress)
                     });
                 }
             } else {
@@ -218,7 +234,7 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                 if (! slicing_ranges.empty())
                     out.push_back({
                         model_volume->id(),
-                        slice_volume(*model_volume, zs, slicing_ranges, params, throw_on_cancel_callback)
+                        slice_volume(*model_volume, zs, slicing_ranges, params, throw_on_cancel_callback, report_progress)
                     });
             }
             if (! out.empty() && out.back().slices.empty())
@@ -1151,6 +1167,14 @@ void PrintObject::slice_volumes()
     BOOST_LOG_TRIVIAL(info) << "Slicing volumes..." << log_memory_info();
     const Print *print                      = this->print();
     const auto   throw_on_cancel_callback   = std::function<void()>([print](){ print->throw_if_canceled(); });
+    // Advance the status bar as an amplified PrintMan volume is consumed. The band is 5..14%,
+    // just below "Generating walls" (15%): the plate percent only moves forward, so a wider band
+    // would overshoot the later steps and pin the bar. slice_scene fires this from parallel
+    // workers, serialized under a mutex (the status path is not concurrency-safe).
+    const auto   report_progress            = std::function<void(size_t, size_t)>(
+        [print](size_t done, size_t total){
+            if (total) print->set_status(int(5.0 + 9.0 * double(done) / double(total)), L("Slicing mesh"));
+        });
 
     // Clear old LayerRegions, allocate for new PrintRegions.
     for (Layer* layer : m_layers) {
@@ -1170,7 +1194,8 @@ void PrintObject::slice_volumes()
     if (!slice_zs.empty()) {
         objSliceByVolume = slice_volumes_inner(
             print->config(), this->config(), this->trafo_centered(),
-            this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback);
+            this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback,
+            report_progress);
     }
 
     //BBS: "model_part" volumes are grouded according to their connections

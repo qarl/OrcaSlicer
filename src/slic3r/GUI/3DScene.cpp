@@ -160,6 +160,9 @@ ColorRGBA GLVolume::SUPPORT_BLOCKER_COL  = {1.0f, 0.3f, 0.3f, 0.4f};
 
 ColorRGBA GLVolume::MODEL_HIDDEN_COL  = {0.f, 0.f, 0.f, 0.3f};
 
+// PrintMan amplified-instance proxy: cyan, translucent so it reads as a stand-in.
+ColorRGBA GLVolume::PRINTMAN_PROXY_COL = {0.2f, 0.6f, 1.0f, 0.45f};
+
 std::array<ColorRGBA, 5> GLVolume::MODEL_COLOR = { {
     { 1.0f, 1.0f, 0.0f, 1.f },
     { 1.0f, 0.5f, 0.5f, 1.f },
@@ -260,6 +263,7 @@ GLVolume::GLVolume(float r, float g, float b, float a)
     , partly_inside(false)
     , hover(HS_None)
     , is_modifier(false)
+    , is_printman_proxy(false)
     , slice_error(false)
     , is_wipe_tower(false)
     , is_extrusion_path(false)
@@ -359,7 +363,9 @@ void GLVolume::set_render_color()
 ColorRGBA color_from_model_volume(const ModelVolume& model_volume)
 {
     ColorRGBA color;
-    if (model_volume.is_negative_volume())
+    if (model_volume.printman_scene.has_value())
+        return GLVolume::PRINTMAN_PROXY_COL;
+    else if (model_volume.is_negative_volume())
         return GLVolume::MODEL_NEGTIVE_COL;
     else if (model_volume.is_modifier())
 #if ENABLE_MODIFIERS_ALWAYS_TRANSPARENT
@@ -803,6 +809,43 @@ std::vector<int> GLVolumeCollection::load_object(
     return volumes_idx;
 }
 
+// Oriented display boxes for a PrintMan proxy: each instance's LOCAL bounding box, its eight
+// corners pushed through the placement transform, so a tilted / scaled instance shows a tilted /
+// scaled box. Display only -- the object's bounds still come from the exact axis-aligned proxy
+// mesh the volume carries, which is what arrange and ensure_on_bed read.
+static indexed_triangle_set printman_oriented_boxes(const PrintMan::PrintManScene &scene)
+{
+    static const int FACES[12][3] = {
+        {0, 3, 2}, {0, 2, 1}, {4, 5, 6}, {4, 6, 7}, {0, 1, 5}, {0, 5, 4},
+        {1, 2, 6}, {1, 6, 5}, {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7},
+    };
+    const float inf = std::numeric_limits<float>::infinity();
+    std::vector<Vec3f> lo(scene.prototypes.size(), Vec3f( inf,  inf,  inf));
+    std::vector<Vec3f> hi(scene.prototypes.size(), Vec3f(-inf, -inf, -inf));
+    for (size_t p = 0; p < scene.prototypes.size(); ++ p)
+        for (const Vec3f &v : scene.prototypes[p].vertices) {
+            lo[p] = lo[p].cwiseMin(v);
+            hi[p] = hi[p].cwiseMax(v);
+        }
+    indexed_triangle_set out;
+    for (const PrintMan::Placement &pl : scene.placements) {
+        if (pl.prototype < 0 || size_t(pl.prototype) >= scene.prototypes.size())
+            continue;
+        const Vec3f &l = lo[pl.prototype], &h = hi[pl.prototype];
+        if (l.x() > h.x())   // prototype had no vertices
+            continue;
+        const Vec3f corners[8] = {
+            {l.x(), l.y(), l.z()}, {h.x(), l.y(), l.z()}, {h.x(), h.y(), l.z()}, {l.x(), h.y(), l.z()},
+            {l.x(), l.y(), h.z()}, {h.x(), l.y(), h.z()}, {h.x(), h.y(), h.z()}, {l.x(), h.y(), h.z()},
+        };
+        const int base = int(out.vertices.size());
+        for (const Vec3f &c : corners)
+            out.vertices.emplace_back((pl.xform * c.cast<double>()).cast<float>());
+        for (const auto &f : FACES)
+            out.indices.emplace_back(base + f[0], base + f[1], base + f[2]);
+    }
+    return out;
+}
 
 int GLVolumeCollection::load_object_volume(
     const ModelObject   *model_object,
@@ -827,7 +870,11 @@ int GLVolumeCollection::load_object_volume(
     v.set_color(color_from_model_volume(*model_volume));
     v.name = model_volume->name;
 
-    v.model.init_from(*mesh);
+    // Proxy display is one oriented box per instance; bounds stay the axis-aligned proxy mesh.
+    if (model_volume->printman_scene)
+        v.model.init_from(TriangleMesh(printman_oriented_boxes(*model_volume->printman_scene)));
+    else
+        v.model.init_from(*mesh);
     if (need_raycaster) { v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(mesh); }
     v.composite_id = GLVolume::CompositeID(obj_idx, volume_idx, instance_idx);
 
@@ -839,6 +886,7 @@ int GLVolumeCollection::load_object_volume(
             v.extruder_id = extruder_id;
     }
     v.is_modifier = !model_volume->is_model_part();
+    v.is_printman_proxy = model_volume->printman_scene.has_value();
     v.shader_outside_printer_detection_enabled = model_volume->is_model_part();
     if (in_assemble_view) {
         v.set_instance_transformation(instance->get_assemble_transformation());
@@ -1619,7 +1667,7 @@ void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *con
     }
 
     for (GLVolume* volume : volumes) {
-        if (volume == nullptr || volume->is_modifier || volume->is_wipe_tower || volume->volume_idx() < 0)
+        if (volume == nullptr || volume->is_modifier || volume->is_printman_proxy || volume->is_wipe_tower || volume->volume_idx() < 0)
             continue;
 
         int extruder_id = volume->extruder_id - 1;
@@ -1642,7 +1690,7 @@ void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *con
 void GLVolumeCollection::set_transparency(float alpha)
 {
     for (GLVolume *volume : volumes) {
-        if (volume == nullptr || volume->is_modifier || volume->is_wipe_tower || (volume->volume_idx() < 0))
+        if (volume == nullptr || volume->is_modifier || volume->is_printman_proxy || volume->is_wipe_tower || (volume->volume_idx() < 0))
             continue;
 
         volume->color.a(alpha);
