@@ -186,6 +186,19 @@ static std::vector<VolumeSlices> slice_volumes_inner(
     //BBS: 0.0025mm is safe enough to simplify the data to speed slicing up for high-resolution model.
     //Also has on influence on arc fitting which has default resolution 0.0125mm.
     params_base.resolution = print_config.resolution <= 0.001 ? 0.0f : 0.0025;
+    // Device rate for slice-time subdivision: the finer of the layer height and the nozzle diameter --
+    // the smallest feature the printer resolves in Z and in-plane. The PrintMan engine picks each
+    // subdivision cage's refinement level from it, so the same cage prints at different densities under
+    // different profiles ("device perfect"). Nozzle diameter stands in for the resolved wall line width:
+    // always in mm, and since the level is log2(size/tol) a finer wall width shifts it by under a level.
+    {
+        double tol = print_object_config.layer_height.value;
+        double nozzle = 0.0;
+        for (double d : print_config.nozzle_diameter.values)
+            nozzle = (nozzle == 0.0) ? d : std::min(nozzle, d);
+        if (nozzle > 0.0) tol = std::min(tol, nozzle);
+        params_base.subdiv_tol = tol > 0.0 ? tol : 0.0;
+    }
     switch (print_object_config.slicing_mode.value) {
     case SlicingMode::Regular:    params_base.mode = MeshSlicingParams::SlicingMode::Regular; break;
     case SlicingMode::EvenOdd:    params_base.mode = MeshSlicingParams::SlicingMode::EvenOdd; break;

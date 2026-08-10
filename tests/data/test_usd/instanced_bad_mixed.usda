@@ -1,0 +1,76 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# One good instanced prototype keeps the amplified scene in use, so the NaN-point and holeIndices
+# prototypes must be refused by the instancing path's own guards (read_prototype_mesh) -- read_stage's
+# standalone fall-through never runs while the good prototype yields placements. Without the guards
+# the NaN prototype poisons the scene bounding box and the holed prototype imports its openings filled.
+def "Prototypes"
+{
+    class Xform "Proto_Good"
+    {
+        def Mesh "Cube"
+        {
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7]
+            point3f[] points = [(0, 0, 0), (30, 0, 0), (30, 30, 0), (0, 30, 0), (0, 0, 30), (30, 0, 30), (30, 30, 30), (0, 30, 30)]
+            uniform token subdivisionScheme = "none"
+        }
+    }
+
+    class Xform "Proto_Nan"
+    {
+        def Mesh "Cube"
+        {
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7]
+            point3f[] points = [(0, 0, 0), (30, 0, 0), (30, 30, 0), (0, 30, 0), (0, 0, 30), (nan, 0, 30), (30, 30, 30), (0, 30, 30)]
+            uniform token subdivisionScheme = "none"
+        }
+    }
+
+    class Xform "Proto_Holes"
+    {
+        def Mesh "Cube"
+        {
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7]
+            point3f[] points = [(0, 0, 0), (30, 0, 0), (30, 30, 0), (0, 30, 0), (0, 0, 30), (30, 0, 30), (30, 30, 30), (0, 30, 30)]
+            int[] holeIndices = [0]
+            uniform token subdivisionScheme = "none"
+        }
+    }
+}
+
+def "Root"
+{
+    def Xform "inst_good" (
+        prepend inherits = </Prototypes/Proto_Good>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "inst_nan" (
+        prepend inherits = </Prototypes/Proto_Nan>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (40, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "inst_holes" (
+        prepend inherits = </Prototypes/Proto_Holes>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (80, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

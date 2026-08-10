@@ -2,6 +2,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,7 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/PrintMan/PrintManScene.hpp"
+#include "libslic3r/Format/USDSubdiv.hpp"
 #include "USD.hpp"
 
 #ifdef _WIN32
@@ -205,12 +207,21 @@ bool tessellate_gprim(const UsdPrim &prim, const UsdTimeCode when, indexed_trian
     return false;
 }
 
+// World map (mm scale + Y-up->Z-up) and USD->Eigen matrix conversion; defined below with the
+// instancing helpers but needed earlier by read_stage to place a deferred cage.
+Transform3d stage_root(double scale, bool y_up);
+Transform3d gf_to_transform(const GfMatrix4d &m);
+
 // One mesh per USD prim, so a stage's structure survives into Orca's model
 // rather than being flattened on the way in.
 struct NamedMesh
 {
     std::string          name;
     indexed_triangle_set its;
+    // Set on the amplify path: a cage deferred to slice time, with `its` its local control mesh and
+    // `xform` its world placement. Absent -> `its` is finished world-space geometry (eager path).
+    std::optional<PrintMan::SubdivCage> cage;
+    Transform3d                         xform = Transform3d::Identity();
 };
 
 // Why the counters exist: every reason a mesh is skipped has to reach the user.
@@ -271,7 +282,65 @@ bool is_renderable(const UsdPrim &prim, const UsdTimeCode when, SkipCounts &skip
     return true;
 }
 
-bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &message)
+// Read a mesh's subdivision attributes (creases, corners, interpolateBoundary, triangleSubdivisionRule)
+// into a local-frame SubdivCage carried to slice time. Winding stays the raw `left_handed` (mirror is
+// held in the placement xform, flipped per placement). When `compute_aabb`, the cage is refined once at
+// `level` = kDeviceLevelMax (the finest, most contracted slice) only to record the limit AABB for bed
+// placement, then discarded; the eager path passes false. Shared by the standalone and instanced paths.
+PrintMan::SubdivCage read_subdiv_cage(const UsdGeomMesh &mesh, UsdTimeCode when,
+                                      const std::vector<usd_subdiv::Pt> &verts,
+                                      const std::vector<int> &counts, const std::vector<int> &indices,
+                                      const std::string &scheme, bool left_handed, int level,
+                                      bool compute_aabb = true)
+{
+    VtIntArray   creaseI, creaseL, cornerI;
+    VtFloatArray creaseS, cornerS;
+    mesh.GetCreaseIndicesAttr().Get(&creaseI, when);
+    mesh.GetCreaseLengthsAttr().Get(&creaseL, when);
+    mesh.GetCreaseSharpnessesAttr().Get(&creaseS, when);
+    mesh.GetCornerIndicesAttr().Get(&cornerI, when);
+    mesh.GetCornerSharpnessesAttr().Get(&cornerS, when);
+    TfToken bnd, tri;
+    mesh.GetInterpolateBoundaryAttr().Get(&bnd, when);
+    mesh.GetTriangleSubdivisionRuleAttr().Get(&tri, when);
+    const std::string b = bnd.GetString();
+    const int boundary = b == "none"     ? usd_subdiv::BOUNDARY_NONE
+                       : b == "edgeOnly" ? usd_subdiv::BOUNDARY_EDGE_ONLY
+                                         : usd_subdiv::BOUNDARY_EDGE_AND_CORNER;
+    const bool tri_smooth = (tri.GetString() == "smooth");
+    const std::vector<int>    ci(creaseI.begin(), creaseI.end());
+    const std::vector<int>    cl(creaseL.begin(), creaseL.end());
+    const std::vector<double> cs(creaseS.begin(), creaseS.end());
+    const std::vector<int>    ki(cornerI.begin(), cornerI.end());
+    const std::vector<double> ks(cornerS.begin(), cornerS.end());
+
+    PrintMan::SubdivCage sc;
+    sc.points.assign(verts.begin(), verts.end());
+    sc.face_counts     = counts;
+    sc.face_indices    = indices;
+    sc.crease_indices  = ci;
+    sc.crease_lengths  = cl;
+    sc.crease_sharp    = cs;
+    sc.corner_indices  = ki;
+    sc.corner_sharp    = ks;
+    sc.boundary        = boundary;
+    sc.triangle_smooth = tri_smooth;
+    sc.flip_winding    = left_handed;
+    sc.scheme          = scheme;
+
+    if (compute_aabb) {
+        // Limit AABB for bed placement; refined_limit_aabb converges-and-stops, so a large cage is not
+        // refined to 4^level transient faces just to measure a box.
+        const usd_subdiv::Cage cage = usd_subdiv::build_cage(verts, counts, indices, ci, cl, cs, ki, ks,
+                                                             boundary, tri_smooth);
+        usd_subdiv::refined_limit_aabb(cage, scheme, level, sc.refined_lo, sc.refined_hi);
+    }
+    return sc;
+}
+
+// amplify defers a subdivision cage to slice time (emits the control mesh + a SubdivCage); without it
+// (the TriangleMesh merge path and the amplify=false reference) a cage is refined eagerly here.
+bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &message, bool amplify = false)
 {
     try {
         if (!register_usd_plugins()) {
@@ -336,32 +405,11 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
                 continue;
             }
 
-            // A subdivision cage is imported as its control mesh, unsmoothed,
-            // and counted so the import says so.
-            //
-            // Absent means catmullClark per the USD spec -- mayaUSD writes the
-            // attribute only when it is NOT the default -- so absence is
-            // reported distinctly, because the fix differs: an author who meant
-            // a polygon mesh just needs to author `uniform token
-            // subdivisionScheme = "none"`.
+            // Absent subdivisionScheme means catmullClark (USD default; mayaUSD omits the default),
+            // reported distinctly so an author who meant a polygon mesh knows to set it to "none".
             TfToken scheme = UsdGeomTokens->catmullClark;
             const bool declared = mesh.GetSubdivisionSchemeAttr().HasAuthoredValue();
             mesh.GetSubdivisionSchemeAttr().Get(&scheme, when);
-            // Imported as the control mesh, not evaluated, which is what the
-            // existing macOS ModelIO path does -- measured, not assumed: on the
-            // USD Working Group's Open Chess Set it returns world bounds of
-            // 0.705416 x 0.168996 x 0.705416, which are the cage's own to six
-            // decimals. Catmull-Clark contracts toward the convex hull, so a
-            // subdividing importer could not have returned them unchanged.
-            //
-            // Refusing instead was implemented first and is worse in practice:
-            // every mesh in that asset is a catmullClark cage, so a refusal loses
-            // the whole model, and DCC exporters emit subdivision by default. How
-            // far a control mesh sits from its limit surface depends on edge
-            // length against local curvature, not on face count, and nothing here
-            // bounds it -- so every cage is counted, and the first few are named
-            // in the log, rather than being quietly accepted. Crease, corner and
-            // interpolateBoundary attributes are ignored along with the scheme.
             const bool is_cage = (scheme != UsdGeomTokens->none);
 
             // holeIndices deletes faces from the authored surface. Ignoring it
@@ -467,37 +515,87 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
             // imports inside-out.
             TfToken orientation = UsdGeomTokens->rightHanded;
             mesh.GetOrientationAttr().Get(&orientation, when);
-            bool flip = (orientation == UsdGeomTokens->leftHanded);
+            const bool left_handed = (orientation == UsdGeomTokens->leftHanded);
+            bool flip = left_handed;
 
             const GfMatrix4d world = xf_cache.GetLocalToWorldTransform(prim);
-            // A mirroring transform flips winding a second time; two flips cancel.
+            // A mirror flips winding again; two flips cancel. The eager path bakes it in; a deferred
+            // cage keeps the mirror in its placement xform, so its own winding stays raw left_handed.
             if (world.GetDeterminant() < 0.0)
                 flip = !flip;
 
-            indexed_triangle_set its;
-            its.vertices.reserve(points.size());
-            for (const GfVec3f &p : points) {
-                GfVec3d w = world.Transform(GfVec3d(p[0], p[1], p[2]));
-                // Y-up to Z-up is a +90 deg rotation about X: (x, y, z) -> (x, -z, y).
-                // The sign matters and is not symmetric -- the inverse rotation
-                // has identical extents but places the model below the plate.
-                double x = w[0], y = w[1], z = w[2];
-                if (y_up) { double t = y; y = -z; z = t; }
-                its.vertices.emplace_back(float(x * scale), float(y * scale), float(z * scale));
+            // A cage is refined to its limit surface. Subdivision is affine-covariant, so refining the
+            // control mesh in its local frame gives the same surface; the amplify path defers this to
+            // slice time (level then follows the print resolution, viewport shows the cage), else here.
+            std::vector<usd_subdiv::Pt> verts;
+            verts.reserve(points.size());
+            for (const GfVec3f &p : points) verts.push_back({p[0], p[1], p[2]});
+            std::vector<int> face_counts(counts.begin(), counts.end());
+            std::vector<int> face_indices(indices.begin(), indices.end());
+
+            std::optional<PrintMan::SubdivCage> deferred_cage;
+            Transform3d                         cage_xform = Transform3d::Identity();
+
+            if (is_cage) {
+                if (amplify) {
+                    // Defer: `verts` stays the control mesh (proxy), the SubdivCage carries the surface.
+                    // Its AABB is at kDeviceLevelMax (finest slice) so the object never floats off the bed.
+                    deferred_cage = read_subdiv_cage(mesh, when, verts, face_counts, face_indices,
+                                                     scheme.GetString(), left_handed, usd_subdiv::kDeviceLevelMax);
+                    cage_xform    = stage_root(scale, y_up) * gf_to_transform(world);
+                } else {
+                    // Eager (amplify=false reference): refine in place at the fixed level; verts/counts/
+                    // indices become the refined surface, baked to world below like any other mesh.
+                    const PrintMan::SubdivCage sc = read_subdiv_cage(
+                        mesh, when, verts, face_counts, face_indices, scheme.GetString(), left_handed,
+                        usd_subdiv::kDeviceLevelMin, /*compute_aabb=*/false);
+                    usd_subdiv::Cage cage = usd_subdiv::subdivide(
+                        usd_subdiv::build_cage(verts, face_counts, face_indices,
+                                               sc.crease_indices, sc.crease_lengths, sc.crease_sharp,
+                                               sc.corner_indices, sc.corner_sharp, sc.boundary,
+                                               sc.triangle_smooth),
+                        scheme.GetString(), usd_subdiv::kDeviceLevelMin);
+                    verts = cage.verts;
+                    face_counts.clear();
+                    for (int f = 0; f < cage.nfaces(); ++ f)
+                        face_counts.push_back(cage.foff[f + 1] - cage.foff[f]);
+                    face_indices = cage.fvi;
+                }
             }
 
-            // Fan-triangulate each n-gon. USD's authored content is mostly quads,
-            // and a fan is correct for any convex face; concave faces produce
-            // overlapping triangles, which the slicer's boolean resolves anyway.
-            // Both the counts and every index value were validated above, so this
-            // loop needs no defensive branches and cannot drop a face.
+            // A deferred cage stays in LOCAL space (its placement xform applies the world transform at
+            // slice time); everything else bakes the world / up-axis / scale transform here.
+            indexed_triangle_set its;
+            its.vertices.reserve(verts.size());
+            for (const usd_subdiv::Pt &p : verts) {
+                double x, y, z;
+                if (deferred_cage) {
+                    x = p[0]; y = p[1]; z = p[2];
+                } else {
+                    GfVec3d w = world.Transform(GfVec3d(p[0], p[1], p[2]));
+                    // Y-up to Z-up is a +90 deg rotation about X: (x, y, z) -> (x, -z, y).
+                    // The sign matters and is not symmetric -- the inverse rotation
+                    // has identical extents but places the model below the plate.
+                    x = w[0]; y = w[1]; z = w[2];
+                    if (y_up) { double t = y; y = -z; z = t; }
+                    x *= scale; y *= scale; z *= scale;
+                }
+                its.vertices.emplace_back(float(x), float(y), float(z));
+            }
+
+            // Fan-triangulate each n-gon. Authored content is mostly quads and subdivision
+            // emits quads or triangles; a fan is correct for any convex face, and concave
+            // faces produce overlapping triangles the slicer's boolean resolves anyway. A deferred
+            // cage carries only left_handed here (the coarse proxy is local); its mirror is applied
+            // at slice time.
+            const bool tri_flip = deferred_cage ? left_handed : flip;
             size_t cursor = 0;
-            for (int n : counts) {
+            for (int n : face_counts) {
                 for (int k = 1; k + 1 < n; ++ k) {
-                    int a = indices[cursor];
-                    int b = indices[cursor + k];
-                    int c = indices[cursor + k + 1];
-                    if (flip) std::swap(b, c);
+                    int a = face_indices[cursor];
+                    int b = face_indices[cursor + k];
+                    int c = face_indices[cursor + k + 1];
+                    if (tri_flip) std::swap(b, c);
                     its.indices.emplace_back(a, b, c);
                 }
                 cursor += size_t(n);
@@ -520,7 +618,7 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
                 continue;
             }
 
-            out.push_back({prim.GetPath().GetString(), std::move(its)});
+            out.push_back({prim.GetPath().GetString(), std::move(its), std::move(deferred_cage), cage_xform});
             ++ mesh_count;
 
             // Counted only once the mesh is actually emitted. Counting it at the
@@ -530,12 +628,14 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
             // had been imported when nothing had been.
             if (is_cage) {
                 if (cages < 5)
-                    BOOST_LOG_TRIVIAL(warning)
+                    BOOST_LOG_TRIVIAL(info)
                         << "load_usd: " << prim.GetPath().GetString() << " is a "
                         << scheme.GetString() << " subdivision cage"
                         << (declared ? "" : " (subdivisionScheme is absent, which USD"
                                             " defines as catmullClark)")
-                        << "; importing its control mesh without subdividing.";
+                        << (amplify ? "; shown as its control cage and refined to its subdivision"
+                                      " surface at slice time."
+                                    : "; refined to its subdivision surface.");
                 ++ cages;
             }
         }
@@ -583,14 +683,9 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
             ++ mesh_count;
         }
 
-        // Anything skipped is stated, whether or not the import goes on to
-        // succeed -- a stage that imported nine of ten meshes must not look like
-        // a clean import. Cages are counted here too: they were imported, but as
-        // their control mesh, which is not the surface the author authored.
-        //
-        // On SUCCESS this reaches the log and the `message` out-param, but
-        // Model::read_from_file reads `message` only when the load fails, so a
-        // user importing a cage sees correct-looking geometry and a log line.
+        // Every skip is stated even on success -- nine of ten meshes must not look like a clean import.
+        // Cages are counted too. Model::read_from_file reads `message` only on failure, so this reaches
+        // the log regardless.
         // Refusals do reach the error dialog. See the note in USD.hpp.
         // The skip tally rides along on every refusal below. The cage note does
         // NOT: it describes meshes that were imported, so attaching it to a
@@ -601,11 +696,11 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
         const std::string tally = describe(skipped);
         const std::string cage_note = cages == 0 ? std::string() :
             std::to_string(cages) + " of the " + std::to_string(mesh_count) +
-            " mesh(es) imported are subdivision cages, taken as their control mesh"
-            " because subdivision is not evaluated yet; where the scheme smooths,"
-            " the printed surface will be boxier than the author's, and crease and"
-            " corner sharpness are ignored. Re-export with"
-            " subdivisionScheme = \"none\" to silence this.";
+            " mesh(es) imported are subdivision cages, refined to their subdivision"
+            " surface (creases, corners and boundaries honoured)" +
+            (amplify ? std::string(" at slice time, at a fixed level;")
+                     : std::string(" at a fixed level;")) +
+            " a high-curvature cage may still print slightly under-refined.";
 
         // holeIndices used to be counted as bad_topology and so was covered by
         // that refusal; with its own counter it needs its own, or a stage of
@@ -704,6 +799,29 @@ bool read_prototype_mesh(const UsdGeomMesh &mesh, UsdTimeCode when,
         ++ skipped.no_data;
         return false;
     }
+    // The same refusals read_stage makes for a standalone mesh, so an instanced prototype cannot slip
+    // geometry past them. holeIndices delete faces: honouring them is unimplemented, and ignoring them
+    // fills an opening the author specified. A non-finite point (NaN/inf) gives the instance no
+    // measurable size and, through its proxy box, poisons the whole scene's bounding box.
+    VtIntArray holes;
+    if (mesh.GetHoleIndicesAttr().Get(&holes, when) && !holes.empty()) {
+        BOOST_LOG_TRIVIAL(error)
+            << "load_usd: " << mesh.GetPrim().GetPath().GetString() << " authors "
+            << holes.size() << " holeIndices, which are not honoured;"
+               " importing it would fill openings the author specified.";
+        ++ skipped.holes;
+        return false;
+    }
+    for (const GfVec3f &p : points)
+        if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+            BOOST_LOG_TRIVIAL(error)
+                << "load_usd: " << mesh.GetPrim().GetPath().GetString()
+                << " has a non-finite point coordinate (nan or inf), which"
+                   " would give the imported object no measurable size.";
+            ++ skipped.nonfinite;
+            return false;
+        }
+
     TfToken orientation = UsdGeomTokens->rightHanded;
     mesh.GetOrientationAttr().Get(&orientation, when);
     const bool flip = (orientation == UsdGeomTokens->leftHanded);
@@ -740,6 +858,38 @@ bool read_prototype_mesh(const UsdGeomMesh &mesh, UsdTimeCode when,
     return true;
 }
 
+// If a prototype prim is a subdivision cage (scheme != none), read it into a SubdivCage so the slicer
+// refines it per placement (the instancing analogue of the standalone deferred cage). False if not.
+bool read_prototype_cage(const UsdGeomMesh &mesh, UsdTimeCode when, int level, PrintMan::SubdivCage &out)
+{
+    TfToken scheme = UsdGeomTokens->catmullClark;   // absent scheme means catmullClark, per the USD spec
+    mesh.GetSubdivisionSchemeAttr().Get(&scheme, when);
+    if (scheme == UsdGeomTokens->none)
+        return false;
+
+    VtVec3fArray points;
+    VtIntArray   counts, indices;
+    if (!mesh.GetPointsAttr().Get(&points, when) ||
+        !mesh.GetFaceVertexCountsAttr().Get(&counts, when) ||
+        !mesh.GetFaceVertexIndicesAttr().Get(&indices, when) ||
+        points.empty() || counts.empty())
+        return false;
+
+    TfToken orientation = UsdGeomTokens->rightHanded;
+    mesh.GetOrientationAttr().Get(&orientation, when);
+    const bool left_handed = (orientation == UsdGeomTokens->leftHanded);
+
+    std::vector<usd_subdiv::Pt> verts;
+    verts.reserve(points.size());
+    for (const GfVec3f &p : points) verts.push_back({p[0], p[1], p[2]});
+    const std::vector<int> face_counts(counts.begin(), counts.end());
+    const std::vector<int> face_indices(indices.begin(), indices.end());
+
+    out = read_subdiv_cage(mesh, when, verts, face_counts, face_indices,
+                           scheme.GetString(), left_handed, level);
+    return true;
+}
+
 // Build a PrintManScene from a stage's instanceable prims: dedup prototypes by prim-in-prototype
 // path, read each once in local space, one placement per instance proxy
 // (root * transpose(local_to_world)). Left empty when the stage carries no instancing.
@@ -766,6 +916,11 @@ void build_instance_scene(const UsdStageRefPtr &stage, UsdTimeCode when,
             idx = int(scene.prototypes.size());
             scene.prototypes.push_back(std::move(proto));
             proto_index.emplace(key, idx);
+            // A cage prototype is deferred like a standalone cage, refined per placement rather than
+            // imported unrefined; the pushed prototype stays the control mesh (the arrangement proxy).
+            PrintMan::SubdivCage sc;
+            if (read_prototype_cage(mesh, when, usd_subdiv::kDeviceLevelMax, sc))
+                scene.cages.emplace(idx, std::move(sc));
         } else {
             idx = found->second;
         }
@@ -812,23 +967,34 @@ indexed_triangle_set box_its(const Vec3f &lo, const Vec3f &hi)
     return b;
 }
 
-// One proxy box per placement -- each instance's EXACT world AABB, merged into one mesh. The
-// viewport shows the arrangement (and arrange/bed read it) while the engine slices the real
-// scene. It must be the exact vertex AABB, not a box-corner over-estimate: a corner box dips
-// below a tilted instance's true geometry, dropping the object bbox below the real lowest point
-// so ensure_on_bed floats it off the bed (empty first layer).
+// One proxy box per placement, merged into one mesh, for the viewport / arrange / bed. For a mesh it is
+// the EXACT vertex AABB (a box-corner over-estimate dips below a tilted instance and floats it off the
+// bed). A cage uses its refined-surface AABB, not the wider control cage which would float the object.
 indexed_triangle_set scene_proxy_boxes(const PrintMan::PrintManScene &scene)
 {
     const double inf = std::numeric_limits<double>::infinity();
     indexed_triangle_set merged;
     for (const PrintMan::Placement &pl : scene.placements) {
         if (pl.prototype < 0 || size_t(pl.prototype) >= scene.prototypes.size()) continue;
-        const indexed_triangle_set &proto = scene.prototypes[pl.prototype];
-        if (proto.vertices.empty()) continue;
         Vec3d lo = Vec3d::Constant(inf), hi = Vec3d::Constant(-inf);
-        for (const stl_vertex &v : proto.vertices) {
-            const Vec3d w = pl.xform * v.cast<double>();
-            lo = lo.cwiseMin(w); hi = hi.cwiseMax(w);
+        const auto cit = scene.cages.find(pl.prototype);
+        if (cit != scene.cages.end()) {
+            const std::array<double, 3> &rlo = cit->second.refined_lo;
+            const std::array<double, 3> &rhi = cit->second.refined_hi;
+            for (int c = 0; c < 8; ++ c) {
+                const Vec3d corner((c & 1) ? rhi[0] : rlo[0],
+                                   (c & 2) ? rhi[1] : rlo[1],
+                                   (c & 4) ? rhi[2] : rlo[2]);
+                const Vec3d w = pl.xform * corner;
+                lo = lo.cwiseMin(w); hi = hi.cwiseMax(w);
+            }
+        } else {
+            const indexed_triangle_set &proto = scene.prototypes[pl.prototype];
+            if (proto.vertices.empty()) continue;
+            for (const stl_vertex &v : proto.vertices) {
+                const Vec3d w = pl.xform * v.cast<double>();
+                lo = lo.cwiseMin(w); hi = hi.cwiseMax(w);
+            }
         }
         const indexed_triangle_set b = box_its(lo.cast<float>(), hi.cast<float>());
         const int base = int(merged.vertices.size());
@@ -837,6 +1003,28 @@ indexed_triangle_set scene_proxy_boxes(const PrintMan::PrintManScene &scene)
             merged.indices.emplace_back(t[0] + base, t[1] + base, t[2] + base);
     }
     return merged;
+}
+
+// Attach a PrintMan scene to a new volume on `object`: the volume carries the proxy-box envelope
+// (what arrange and ensure_on_bed read), and the scene is re-expressed in the centred frame
+// add_volume introduces (-mesh_offset), so the +off in get_matrix() cancels instead of double-
+// shifting params.trafo * get_matrix(). Shared by the instancing and standalone-cage paths.
+ModelVolume *add_scene_volume(Model *model, ModelObject *object, const std::string &name,
+                              const char *path, PrintMan::PrintManScene &&scene)
+{
+    ModelVolume *volume = object->add_volume(TriangleMesh(scene_proxy_boxes(scene)));
+    volume->name              = name;
+    volume->source.input_file = path;
+    volume->source.object_idx = (int) model->objects.size() - 1;
+    volume->source.volume_idx = (int) object->volumes.size() - 1;
+    const Vec3d off = volume->source.mesh_offset;
+    for (PrintMan::Placement &pl : scene.placements) {
+        Transform3d shift = Transform3d::Identity();
+        shift.translate(-off);
+        pl.xform = shift * pl.xform;
+    }
+    volume->printman_scene = std::move(scene);
+    return volume;
 }
 
 } // namespace
@@ -884,29 +1072,14 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
             ModelObject *object = model->add_object();
             object->name       = object_name;
             object->input_file = path;
-
-            ModelVolume *volume = object->add_volume(TriangleMesh(scene_proxy_boxes(scene)));
-            volume->name              = object_name;
-            volume->source.input_file = path;
-            volume->source.object_idx = (int) model->objects.size() - 1;
-            volume->source.volume_idx = 0;
-            // add_volume centres the envelope and compensates in get_matrix(); express the scene
-            // in that same centred frame (-mesh_offset), so the +off in get_matrix and the -off
-            // here cancel instead of double-shifting params.trafo * get_matrix().
-            const Vec3d off = volume->source.mesh_offset;
-            for (PrintMan::Placement &pl : scene.placements) {
-                Transform3d shift = Transform3d::Identity();
-                shift.translate(-off);
-                pl.xform = shift * pl.xform;
-            }
-            volume->printman_scene = std::move(scene);
+            add_scene_volume(model, object, object_name, path, std::move(scene));
             return true;
         }
     }
 
-    // Non-instanced stage (or amplify=false): one ModelVolume per mesh prim.
+    // Non-instanced stage (or amplify=false): one ModelVolume per mesh prim; amplify defers cages here too.
     std::vector<NamedMesh> meshes;
-    if (! read_stage(path, meshes, message))
+    if (! read_stage(path, meshes, message, amplify))
         return false;
 
     ModelObject *object = model->add_object();
@@ -914,12 +1087,25 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
     object->input_file = path;
 
     for (NamedMesh &m : meshes) {
-        ModelVolume *volume = object->add_volume(TriangleMesh(std::move(m.its)));
-        // The prim path, so a volume in the UI can be traced back to the stage.
-        volume->name              = m.name;
-        volume->source.input_file = path;
-        volume->source.object_idx = (int) model->objects.size() - 1;
-        volume->source.volume_idx = (int) object->volumes.size() - 1;
+        if (m.cage) {
+            // A cage becomes a one-placement PrintMan scene (refined at slice time, cage shown in the
+            // viewport); other prims still import flat, so a mixed stage keeps every prim.
+            PrintMan::PrintManScene scene;
+            scene.prototypes.push_back(std::move(m.its));   // coarse control mesh, prototype-local
+            PrintMan::Placement place;
+            place.prototype = 0;
+            place.xform     = m.xform;
+            scene.placements.push_back(place);
+            scene.cages.emplace(0, std::move(*m.cage));
+            add_scene_volume(model, object, m.name, path, std::move(scene));
+        } else {
+            ModelVolume *volume = object->add_volume(TriangleMesh(std::move(m.its)));
+            // The prim path, so a volume in the UI can be traced back to the stage.
+            volume->name              = m.name;
+            volume->source.input_file = path;
+            volume->source.object_idx = (int) model->objects.size() - 1;
+            volume->source.volume_idx = (int) object->volumes.size() - 1;
+        }
     }
 
     return true;
