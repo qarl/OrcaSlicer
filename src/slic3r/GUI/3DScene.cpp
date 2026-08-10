@@ -809,11 +809,9 @@ std::vector<int> GLVolumeCollection::load_object(
     return volumes_idx;
 }
 
-// Oriented display boxes for a PrintMan proxy: each instance's LOCAL bounding box, its eight
-// corners pushed through the placement transform, so a tilted / scaled instance shows a tilted /
-// scaled box. Display only -- the object's bounds still come from the exact axis-aligned proxy
-// mesh the volume carries, which is what arrange and ensure_on_bed read.
-static indexed_triangle_set printman_oriented_boxes(const PrintMan::PrintManScene &scene)
+// Display proxy for a PrintMan volume: an oriented box per instanced placement, or a subdivision
+// cage's control mesh (previewed translucent). Display only -- bounds come from the volume's proxy mesh.
+static indexed_triangle_set printman_proxy_mesh(const PrintMan::PrintManScene &scene)
 {
     static const int FACES[12][3] = {
         {0, 3, 2}, {0, 2, 1}, {4, 5, 6}, {4, 6, 7}, {0, 1, 5}, {0, 5, 4},
@@ -831,6 +829,16 @@ static indexed_triangle_set printman_oriented_boxes(const PrintMan::PrintManScen
     for (const PrintMan::Placement &pl : scene.placements) {
         if (pl.prototype < 0 || size_t(pl.prototype) >= scene.prototypes.size())
             continue;
+        const int base = int(out.vertices.size());
+        if (scene.cages.count(pl.prototype)) {
+            // A subdivision cage: preview its control mesh, not a box.
+            const indexed_triangle_set &proto = scene.prototypes[pl.prototype];
+            for (const Vec3f &v : proto.vertices)
+                out.vertices.emplace_back((pl.xform * v.cast<double>()).cast<float>());
+            for (const auto &t : proto.indices)
+                out.indices.emplace_back(base + t[0], base + t[1], base + t[2]);
+            continue;
+        }
         const Vec3f &l = lo[pl.prototype], &h = hi[pl.prototype];
         if (l.x() > h.x())   // prototype had no vertices
             continue;
@@ -838,7 +846,6 @@ static indexed_triangle_set printman_oriented_boxes(const PrintMan::PrintManScen
             {l.x(), l.y(), l.z()}, {h.x(), l.y(), l.z()}, {h.x(), h.y(), l.z()}, {l.x(), h.y(), l.z()},
             {l.x(), l.y(), h.z()}, {h.x(), l.y(), h.z()}, {h.x(), h.y(), h.z()}, {l.x(), h.y(), h.z()},
         };
-        const int base = int(out.vertices.size());
         for (const Vec3f &c : corners)
             out.vertices.emplace_back((pl.xform * c.cast<double>()).cast<float>());
         for (const auto &f : FACES)
@@ -872,7 +879,7 @@ int GLVolumeCollection::load_object_volume(
 
     // Proxy display is one oriented box per instance; bounds stay the axis-aligned proxy mesh.
     if (model_volume->printman_scene)
-        v.model.init_from(TriangleMesh(printman_oriented_boxes(*model_volume->printman_scene)));
+        v.model.init_from(TriangleMesh(printman_proxy_mesh(*model_volume->printman_scene)));
     else
         v.model.init_from(*mesh);
     if (need_raycaster) { v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(mesh); }

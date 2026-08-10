@@ -44,6 +44,11 @@ struct MeshSlicingParamsEx : public MeshSlicingParams
     // Resolution for contour simplification, unscaled.
     // 0 = don't simplify.
     double        resolution { 0 };
+    // Device rate for slice-time subdivision: the target facet size in mm (min of layer height and
+    // nozzle diameter). The PrintMan engine picks each cage's refinement level from it. 0 = unset,
+    // which drops the size term (level 2, or higher only if a crease/extraordinary-vertex floor
+    // applies) -- so a plain mesh slice, which never reads this, is unaffected.
+    double        subdiv_tol { 0 };
 };
 
 // All the following slicing functions shall produce consistent results with the same mesh, same transformation matrix and slicing parameters.
