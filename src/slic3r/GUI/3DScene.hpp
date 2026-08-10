@@ -93,6 +93,8 @@ public:
     static ColorRGBA SUPPORT_ENFORCER_COL;
     static ColorRGBA SUPPORT_BLOCKER_COL;
     static ColorRGBA MODEL_HIDDEN_COL;
+    // A PrintMan amplified-instance proxy; rendered translucent so it reads as a stand-in.
+    static ColorRGBA PRINTMAN_PROXY_COL;
 
     static void update_render_colors();
     static void load_render_colors();
@@ -204,6 +206,8 @@ public:
         bool                partly_inside : 1;
 	    // Wheter or not this volume has been generated from a modifier
 	    bool                is_modifier : 1;
+	    // Whether this volume is a PrintMan amplified-instance proxy
+	    bool                is_printman_proxy : 1;
 	    // Wheter or not this volume has been generated from the wipe tower
         bool                is_wipe_tower : 1;
 	    // Wheter or not this volume has been generated from an extrusion path
