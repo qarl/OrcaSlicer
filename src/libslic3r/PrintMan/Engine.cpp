@@ -366,9 +366,17 @@ static void slice_cage_placement(const CageProto &cp,
             if (flip_det)
                 its_flip_triangles(its);
             if (displacement) {   // move each refined vertex along its normal (world space)
-                [[maybe_unused]] const double moved = apply_displacement(its, displacement.eval);
-                // max_magnitude must bound the field, or the selection growth above was too small
-                // and faces displacing into this band were silently dropped.
+                const double moved = apply_displacement(its, displacement.eval);
+                // The field MUST stay within max_magnitude: the band's face selection was grown by
+                // exactly that (above), so a larger move means faces that displaced into this band
+                // were never selected and are silently missing from the slice. Warn in release too
+                // (the assert is debug-only) -- dropping geometry without a word is the real hazard.
+                // A clamp/sample/declare policy for arbitrary (e.g. OSL) shaders is deferred.
+                if (moved > max_disp + 1e-6)
+                    BOOST_LOG_TRIVIAL(warning)
+                        << "PrintMan: displacement of " << moved << " mm exceeded the declared bound "
+                        << max_disp << " mm; geometry that displaced past this band may be missing "
+                           "from the slice. Raise DisplacementField::max_magnitude to bound the shader.";
                 assert(moved <= max_disp + 1e-6);
             }
             drop_triangles_outside_band(its, zlo, zhi);
