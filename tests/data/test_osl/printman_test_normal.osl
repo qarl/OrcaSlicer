@@ -1,0 +1,10 @@
+// Orientation-driven test shader: displacement depends on all three normal components and barely on
+// position -- exercises the N path where the mixed shader leans on P. Structured as Amp*f with f<=1,
+// so max_magnitude = Amp is always a safe (if loose) bound.
+shader printman_test_normal(
+    float Amp = 0.3,   // mm, the upper bound on displacement
+    output float Disp = 0.0)
+{
+    float f = 0.4 + 0.2 * abs(N[0]) + 0.2 * abs(N[1]) + 0.2 * abs(N[2]);  // in [~0.6, ~0.75] <= 1
+    Disp = Amp * f;
+}

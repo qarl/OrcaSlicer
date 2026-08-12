@@ -1,0 +1,11 @@
+// High-frequency test shader: fine spatial oscillation in P (many ridges across a small cage) --
+// stresses that OSL's per-point evaluation tracks the C++ oracle even where displacement varies
+// sharply between refined vertices. Structured as Amp*f with f in [0,1], so max_magnitude = Amp.
+shader printman_test_hifreq(
+    float Amp  = 0.3,   // mm, the upper bound on displacement
+    float Freq = 8.0,
+    output float Disp = 0.0)
+{
+    float f = 0.5 + 0.5 * sin(Freq * P[0]) * cos(Freq * P[1]);  // in [0, 1]
+    Disp = Amp * f;
+}

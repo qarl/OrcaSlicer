@@ -72,18 +72,23 @@ if (SLIC3R_OSL)
     find_library(OSL_OIIOU_LIB OpenImageIO_Util PATHS "${OSL_BREW}/lib" REQUIRED)
     find_program(OSLC_BIN oslc              PATHS "${OSL_ROOT}/build/bin" NO_DEFAULT_PATH REQUIRED)
 
-    # Compile the test shader to bytecode beside the test binary's build dir; the test reads it there.
+    # Compile each test shader to bytecode beside the test binary's build dir; the test reads them there.
     set(_osl_oso_dir "${CMAKE_CURRENT_BINARY_DIR}/osl_shaders")
-    set(_osl_src "${CMAKE_CURRENT_SOURCE_DIR}/../data/test_osl/printman_test_disp.osl")
-    add_custom_command(
-        OUTPUT "${_osl_oso_dir}/printman_test_disp.oso"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${_osl_oso_dir}"
-        COMMAND "${OSLC_BIN}" -I"${OSL_ROOT}/src/shaders"
-                -o "${_osl_oso_dir}/printman_test_disp.oso" "${_osl_src}"
-        DEPENDS "${_osl_src}"
-        COMMENT "Compiling the OSL test shader (oslc)")
-    add_custom_target(printman_osl_test_shader DEPENDS "${_osl_oso_dir}/printman_test_disp.oso")
-    add_dependencies(${_TEST_NAME}_tests printman_osl_test_shader)
+    set(_osl_shaders printman_test_disp printman_test_normal printman_test_hifreq)
+    set(_osl_oso_files "")
+    foreach(_sh ${_osl_shaders})
+        add_custom_command(
+            OUTPUT "${_osl_oso_dir}/${_sh}.oso"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_osl_oso_dir}"
+            COMMAND "${OSLC_BIN}" -I"${OSL_ROOT}/src/shaders"
+                    -o "${_osl_oso_dir}/${_sh}.oso"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/../data/test_osl/${_sh}.osl"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../data/test_osl/${_sh}.osl"
+            COMMENT "Compiling OSL test shader ${_sh} (oslc)")
+        list(APPEND _osl_oso_files "${_osl_oso_dir}/${_sh}.oso")
+    endforeach()
+    add_custom_target(printman_osl_test_shaders DEPENDS ${_osl_oso_files})
+    add_dependencies(${_TEST_NAME}_tests printman_osl_test_shaders)
 
     target_sources(${_TEST_NAME}_tests PRIVATE test_osl_displace.cpp)
     target_include_directories(${_TEST_NAME}_tests PRIVATE
