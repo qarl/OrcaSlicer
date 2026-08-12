@@ -4,10 +4,10 @@
 // Displacement shading for the amplification engine: a shader moves each refined surface
 // vertex along its normal. Zero-dependency std (like USDSubdiv.hpp), ported from and
 // validated bit-for-bit against printman/shade.py (Device/Gridwork/Noise) and mesh.py
-// (area-weighted vertex_normals). See the PrintMan design docs for the model and the vertex rule.
-// NOTE: this uses single per-band vertex normals; across band seams that is only continuous while
-// the displacement magnitude is >~ the layer height (see slice_cage_placement). Band-invariant
-// normals (for low-amplitude fields) are a follow-up.
+// (mesh.py). See the PrintMan design docs for the model and the per-face-average vertex rule.
+// NOTE: normals are computed per-band (on each band's core mesh), so across band seams continuity
+// only holds while the displacement magnitude is >~ the layer height (see slice_cage_placement);
+// band-invariant normals for low-amplitude fields are a deferred follow-up.
 
 #include <algorithm>
 #include <array>
@@ -99,37 +99,54 @@ struct Noise {
     }
 };
 
-// ---- geometry: area-weighted vertex normals + displacement application ----------------------
+// ---- geometry: the per-face-average primvar reducer + displacement application --------------
 
-// Area-weighted unit vertex normals of a world-space mesh (mesh.py vertex_normals), in double.
-inline std::vector<V3> vertex_normals(const indexed_triangle_set &its) {
-    std::vector<V3> N(its.vertices.size(), V3{{0, 0, 0}});
-    for (const auto &t : its.indices) {
-        const Vec3f &a = its.vertices[t[0]], &b = its.vertices[t[1]], &c = its.vertices[t[2]];
-        const double e1x = double(b.x()) - a.x(), e1y = double(b.y()) - a.y(), e1z = double(b.z()) - a.z();
-        const double e2x = double(c.x()) - a.x(), e2y = double(c.y()) - a.y(), e2z = double(c.z()) - a.z();
-        const V3 w{{e1y * e2z - e1z * e2y, e1z * e2x - e1x * e2z, e1x * e2y - e1y * e2x}};
-        for (int k = 0; k < 3; ++k) { N[t[k]][0] += w[0]; N[t[k]][1] += w[1]; N[t[k]][2] += w[2]; }
-    }
-    for (V3 &n : N) {
-        const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        if (len > 0.0) { n[0] /= len; n[1] /= len; n[2] /= len; }
-    }
-    return N;
+// Unit face normal of a triangle read as double. Zero if degenerate.
+inline V3 face_normal(const Vec3f &a, const Vec3f &b, const Vec3f &c) {
+    const double e1x = double(b.x()) - a.x(), e1y = double(b.y()) - a.y(), e1z = double(b.z()) - a.z();
+    const double e2x = double(c.x()) - a.x(), e2y = double(c.y()) - a.y(), e2z = double(c.z()) - a.z();
+    const V3 w{{e1y * e2z - e1z * e2y, e1z * e2x - e1x * e2z, e1x * e2y - e1y * e2x}};
+    const double len = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    return len > 0.0 ? V3{{w[0] / len, w[1] / len, w[2] / len}} : V3{{0, 0, 0}};
 }
 
-// Displace each vertex of a world-space mesh along its (single, area-weighted) normal by
-// shader(point, normal) mm. Returns max |displacement|. Matches the current shade.py pipeline
-// (single fine-mesh vertex normals); the per-face-average rule is a later refinement.
+// Per-face-average primvar reducer: for each triangle, `contrib(vertex_pos, unit_face_normal)`
+// yields a Vec3; accumulate onto each of the triangle's vertices, then divide by the
+// incident-face count. One averaged Vec3 per vertex. Generic so it serves displacement (a d*n
+// vector) now and colour later. Validated against tools/gen_reduce_golden.py.
+template <typename Contrib>
+inline std::vector<V3> per_face_average(const indexed_triangle_set &its, const Contrib &contrib) {
+    std::vector<V3>  accum(its.vertices.size(), V3{{0, 0, 0}});
+    std::vector<int> count(its.vertices.size(), 0);
+    for (const auto &t : its.indices) {
+        const V3 fn = face_normal(its.vertices[t[0]], its.vertices[t[1]], its.vertices[t[2]]);
+        for (int k = 0; k < 3; ++k) {
+            const Vec3f &vk = its.vertices[t[k]];
+            const V3 c = contrib(V3{{double(vk.x()), double(vk.y()), double(vk.z())}}, fn);
+            accum[t[k]][0] += c[0]; accum[t[k]][1] += c[1]; accum[t[k]][2] += c[2];
+            ++count[t[k]];
+        }
+    }
+    for (size_t i = 0; i < accum.size(); ++i)
+        if (count[i] > 0) { accum[i][0] /= count[i]; accum[i][1] /= count[i]; accum[i][2] /= count[i]; }
+    return accum;
+}
+
+// Displace each vertex by the per-face-average of d(point, face_normal) * face_normal (mm):
+// watertight (one position per shared vertex, no crack), faithful to normal-dependent shaders
+// (each face's real orientation), and auto-damping at edges (the averaged vector shrinks where
+// the incident normals diverge). Returns max |displacement|.
 inline double apply_displacement(indexed_triangle_set &its, const DisplaceShader &shader) {
-    const std::vector<V3> N = vertex_normals(its);
+    const std::vector<V3> dv = per_face_average(its, [&](const V3 &p, const V3 &n) {
+        const double d = shader(p, n);
+        return V3{{d * n[0], d * n[1], d * n[2]}};
+    });
     double maxd = 0.0;
     for (size_t i = 0; i < its.vertices.size(); ++i) {
-        const Vec3f &vf = its.vertices[i];
-        const V3 p{{double(vf.x()), double(vf.y()), double(vf.z())}};
-        const double d = shader(p, N[i]);
-        its.vertices[i] = Vec3f(float(p[0] + d * N[i][0]), float(p[1] + d * N[i][1]), float(p[2] + d * N[i][2]));
-        maxd = std::max(maxd, std::abs(d));
+        Vec3f &v = its.vertices[i];
+        v = Vec3f(float(double(v.x()) + dv[i][0]), float(double(v.y()) + dv[i][1]), float(double(v.z()) + dv[i][2]));
+        const double mag = std::sqrt(dv[i][0] * dv[i][0] + dv[i][1] * dv[i][1] + dv[i][2] * dv[i][2]);
+        if (mag > maxd) maxd = mag;
     }
     return maxd;
 }
