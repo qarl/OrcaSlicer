@@ -37,6 +37,67 @@ struct UsdResourcesFixture
     std::string previous;
 };
 
+SCENARIO_METHOD(UsdResourcesFixture, "A displacement shader moves the sliced surface", "[usd][subdiv][PrintMan][displace]")
+{
+    GIVEN("a subdivision cube sliced with and without a raised Gridwork displacement") {
+        Model       model;
+        std::string message;
+        REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, true));
+        const ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+        REQUIRE(vol->printman_scene->cages.size() == 1);
+
+        const Transform3d m = vol->get_matrix();
+        float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+        for (const Vec3f &v : vol->mesh().its.vertices) {
+            const float z = float((m * v.cast<double>()).z());
+            zmin = std::min(zmin, z);
+            zmax = std::max(zmax, z);
+        }
+        std::vector<float> zs;
+        for (float z = zmin + 0.1f; z < zmax - 1e-4f; z += 0.2f)
+            zs.push_back(z);
+        REQUIRE(zs.size() > 10);
+
+        MeshSlicingParamsEx params;
+        params.trafo      = m;
+        params.subdiv_tol = 0.05;
+
+        // A raised gridwork displacement, evaluated in world space (mm).
+        PrintMan::Device            dev;
+        PrintMan::Gridwork          gw;
+        PrintMan::DisplacementField disp;
+        disp.max_magnitude = gw.effective_depth(dev);
+        disp.eval = [gw, dev](const PrintMan::V3 &p, const PrintMan::V3 &n) { return gw(p, n, dev); };
+
+        const std::vector<ExPolygons> plain    = PrintMan::slice_scene(*vol->printman_scene, params, zs);
+        const std::vector<ExPolygons> textured = PrintMan::slice_scene(*vol->printman_scene, params, zs,
+                                                                       [](){}, {}, disp);
+
+        REQUIRE(plain.size()    == zs.size());
+        REQUIRE(textured.size() == zs.size());
+
+        auto total_area = [](const std::vector<ExPolygons> &layers) {
+            double a = 0.0;
+            for (const ExPolygons &layer : layers)
+                for (const ExPolygon &ep : layer)
+                    a += ep.area();
+            return a;
+        };
+        const double a_plain    = total_area(plain);
+        const double a_textured = total_area(textured);
+
+        THEN("both slice to valid, non-empty contours") {
+            REQUIRE(a_plain    > 0.0);
+            REQUIRE(a_textured > 0.0);
+        }
+        THEN("displacement changes the geometry, and a raised gridwork grows it outward") {
+            REQUIRE(std::abs(a_textured - a_plain) > 0.02 * a_plain);   // measurably different
+            REQUIRE(a_textured > a_plain);                             // raised => pushed out
+        }
+    }
+}
+
 SCENARIO_METHOD(UsdResourcesFixture, "Reading a USD file", "[usd]")
 {
     GIVEN("a stage declaring metersPerUnit and a Y up-axis") {

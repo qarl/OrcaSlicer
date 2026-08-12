@@ -7,10 +7,20 @@
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/PrintMan/PrintManScene.hpp"
+#include "libslic3r/PrintMan/Displace.hpp"   // DisplaceShader
 
 namespace Slic3r {
 struct MeshSlicingParamsEx;   // libslic3r/TriangleMeshSlicer.hpp
 namespace PrintMan {
+
+// Optional displacement shader for the amplification engine: it moves each refined surface
+// vertex along its normal by eval(world_point, unit_normal) mm. max_magnitude bounds |eval| so
+// the band loop can grow its face selection. Empty (the default) leaves the existing path.
+struct DisplacementField {
+    DisplaceShader eval;
+    double         max_magnitude = 0.0;
+    explicit operator bool() const { return bool(eval); }
+};
 
 // Slice an instanced scene into per-layer contours by amplifying one prototype through each
 // placement, unioned -- the N-instance geometry is never baked. Mirrors slice_mesh_ex so it
@@ -21,7 +31,8 @@ std::vector<ExPolygons> slice_scene(
     const MeshSlicingParamsEx   &params,
     const std::vector<float>    &zs,
     const std::function<void()> &throw_on_cancel = [](){},
-    const std::function<void(size_t, size_t)> &report_progress = {});
+    const std::function<void(size_t, size_t)> &report_progress = {},
+    const DisplacementField     &displacement = {});
 
 }} // namespace Slic3r::PrintMan
 

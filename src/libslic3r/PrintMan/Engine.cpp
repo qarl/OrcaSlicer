@@ -300,7 +300,8 @@ static void slice_cage_placement(const CageProto &cp,
                                  const std::vector<float> &zs, const Placement &place,
                                  const std::function<void()> &throw_on_cancel,
                                  std::vector<ExPolygons> &out_local,
-                                 const std::function<void()> &on_band)
+                                 const std::function<void()> &on_band,
+                                 const DisplacementField &displacement)
 {
     const usd_subdiv::Cage &cage = cp.cage;
     assert(cp.scheme == "catmullClark");   // build_cage_protos engages a CageProto only for CC cages
@@ -326,6 +327,19 @@ static void slice_cage_placement(const CageProto &cp,
     // Each face's 1-ring-hull world-Z range (the selection key) and the widest span (band sizing).
     const BandKeys bk = cage_band_keys(cp, m);
 
+    // Displacement moves refined vertices along their normal by up to this, so the band's face
+    // selection is grown by it below. Two first-cut limits (see the PrintMan design docs):
+    //   - Orca's layer set is fixed before we run, so relief that pushes past the top/bottom
+    //     layers is clipped.
+    //   - SEAM CONTINUITY across bands holds only while max_disp is comparable to the layer
+    //     height. Each band computes vertex normals on its core-ONLY refined mesh, so a shared
+    //     boundary vertex can get slightly different normals in adjacent bands. When max_disp is
+    //     >~ a layer, the grown selection keeps every incident face co-present in both bands and
+    //     the normals agree; a low-amplitude field (max_disp < layer height) can step quietly at
+    //     a band boundary. The fix -- band-invariant (halo-consistent / analytic-limit) normals --
+    //     is a follow-up; until then displacement is only sound for max_disp >~ the layer height.
+    const double max_disp = displacement ? displacement.max_magnitude : 0.0;
+
     // Band thickness ~ the widest 1-ring Z-span (in layers), clamped: a face then falls in ~one band,
     // not every band its 1-ring touches -- a memory-for-refine trade.
     const size_t nlayers     = zs.size();
@@ -342,7 +356,7 @@ static void slice_cage_placement(const CageProto &cp,
 
         std::vector<int> core;
         for (int f = 0; f < cage.nfaces(); ++ f)
-            if (bk.fhi[f] >= zlo && bk.flo[f] <= zhi)
+            if (bk.fhi[f] >= zlo - max_disp && bk.flo[f] <= zhi + max_disp)
                 core.push_back(f);
         if (! core.empty()) {
             usd_subdiv::Cage     region = usd_subdiv::refine_region(cage, cp.vf, core, level);
@@ -351,8 +365,14 @@ static void slice_cage_placement(const CageProto &cp,
                 v = (m * v.cast<double>()).cast<float>();
             if (flip_det)
                 its_flip_triangles(its);
+            if (displacement) {   // move each refined vertex along its normal (world space)
+                [[maybe_unused]] const double moved = apply_displacement(its, displacement.eval);
+                // max_magnitude must bound the field, or the selection growth above was too small
+                // and faces displacing into this band were silently dropped.
+                assert(moved <= max_disp + 1e-6);
+            }
             drop_triangles_outside_band(its, zlo, zhi);
-            assert(band_is_closed_over(its, zlo, zhi));
+            assert(displacement || band_is_closed_over(its, zlo, zhi));  // closedness is a non-displaced guarantee
 
             MeshSlicingParamsEx p = params;
             p.trafo = Transform3d::Identity();
@@ -387,7 +407,8 @@ std::vector<ExPolygons> slice_scene(
     const MeshSlicingParamsEx   &params,
     const std::vector<float>    &zs,
     const std::function<void()> &throw_on_cancel,
-    const std::function<void(size_t, size_t)> &report_progress)
+    const std::function<void(size_t, size_t)> &report_progress,
+    const DisplacementField     &displacement)
 {
     // Slice placements in parallel into thread-local per-layer buckets, merged at the end. Union is
     // associative and idempotent, so the result matches serial order.
@@ -438,7 +459,7 @@ std::vector<ExPolygons> slice_scene(
                 const Placement &place = scene.placements[pi];
                 const int        proto = place.prototype;
                 if (proto >= 0 && size_t(proto) < cageprotos.size() && cageprotos[proto])
-                    slice_cage_placement(*cageprotos[proto], params, zs, place, throw_on_cancel, out_local, bump);
+                    slice_cage_placement(*cageprotos[proto], params, zs, place, throw_on_cancel, out_local, bump, displacement);
                 else {
                     slice_placement(protos, params, zs, place, throw_on_cancel, out_local);
                     bump();
