@@ -1,0 +1,13 @@
+// End-to-end test displacement shader: the same formula lives in test_osl_displace.cpp as a C++
+// lambda, and the test asserts OSL slices the cube identically. Strictly positive so it visibly
+// grows the surface vs the plain slice; P- and N-dependent so a mis-wired global would diverge;
+// bounded by Amp (max_magnitude), so the engine's band growth stays correct.
+shader printman_test_disp(
+    float Amp  = 0.3,   // mm, the maximum displacement
+    float Freq = 3.0,
+    output float Disp = 0.0)
+{
+    float relief = 0.6 + 0.2 * sin(Freq * P[0]) + 0.2 * cos(Freq * P[1]);  // in [0.2, 1.0]
+    float tilt   = 0.7 + 0.3 * abs(N[2]);                                  // in [0.7, 1.0]
+    Disp = Amp * relief * tilt;
+}
