@@ -222,6 +222,9 @@ struct NamedMesh
     // `xform` its world placement. Absent -> `its` is finished world-space geometry (eager path).
     std::optional<PrintMan::SubdivCage> cage;
     Transform3d                         xform = Transform3d::Identity();
+    // Optional OSL displacement shader authored on the prim (printman:oslShader / :maxDisplacement).
+    std::string                         osl_shader;
+    double                              osl_max_displacement = 0.0;
 };
 
 // Why the counters exist: every reason a mesh is skipped has to reach the user.
@@ -618,7 +621,18 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
                 continue;
             }
 
-            out.push_back({prim.GetPath().GetString(), std::move(its), std::move(deferred_cage), cage_xform});
+            // Optional displacement shader authored on the prim: a compiled .oso name plus the declared
+            // bound. Carried to the scene and applied at slice time when the build links OSL (ignored
+            // otherwise). Only meaningful for a deferred cage (the amplify path).
+            std::string osl_shader;
+            float       osl_max = 0.0f;
+            if (deferred_cage) {
+                mesh.GetPrim().GetAttribute(TfToken("printman:oslShader")).Get(&osl_shader, when);
+                mesh.GetPrim().GetAttribute(TfToken("printman:maxDisplacement")).Get(&osl_max, when);
+            }
+
+            out.push_back({prim.GetPath().GetString(), std::move(its), std::move(deferred_cage),
+                           cage_xform, osl_shader, double(osl_max)});
             ++ mesh_count;
 
             // Counted only once the mesh is actually emitted. Counting it at the
@@ -1097,6 +1111,8 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
             place.xform     = m.xform;
             scene.placements.push_back(place);
             scene.cages.emplace(0, std::move(*m.cage));
+            scene.osl_shader           = m.osl_shader;           // displacement shader from the prim
+            scene.osl_max_displacement = m.osl_max_displacement;
             add_scene_volume(model, object, m.name, path, std::move(scene));
         } else {
             ModelVolume *volume = object->add_volume(TriangleMesh(std::move(m.its)));

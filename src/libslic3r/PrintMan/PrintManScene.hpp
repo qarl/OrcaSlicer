@@ -46,6 +46,12 @@ struct PrintManScene
     std::vector<indexed_triangle_set> prototypes;
     std::vector<Placement>            placements;
     std::map<int, SubdivCage>         cages;   // prototype index -> cage; absent = a plain mesh
+
+    // Optional displacement shader, read from the USD prim (printman:oslShader / printman:maxDisplacement).
+    // The name is a compiled .oso on the OSL shader searchpath; the bound grows the slice band so the
+    // relief is not clipped. Only honoured when the build links OSL (SLIC3R_OSL); empty = no displacement.
+    std::string osl_shader;
+    double      osl_max_displacement = 0.0;
 };
 
 }} // namespace Slic3r::PrintMan

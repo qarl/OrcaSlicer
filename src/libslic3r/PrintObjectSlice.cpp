@@ -13,6 +13,10 @@
 #include "ShortestPath.hpp"
 #include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
 #include "PrintMan/Engine.hpp"
+#ifdef SLIC3R_OSL
+#include <optional>
+#include "PrintMan/OslShader.hpp"
+#endif
 
 //! macro used to mark string used at localization, return same string
 #define L(s) Slic3r::I18N::translate(s)
@@ -92,7 +96,24 @@ static std::vector<ExPolygons> slice_volume(
             // params to every placement.
             MeshSlicingParamsEx params2 { params };
             params2.trafo = params.trafo * volume.get_matrix();
-            layers = PrintMan::slice_scene(*volume.printman_scene, params2, zs, throw_on_cancel_callback, report_progress);
+            PrintMan::DisplacementField disp;
+#ifdef SLIC3R_OSL
+            // A displacement shader authored on the USD prim (scene.osl_shader) is evaluated per
+            // refined surface point at slice time. A load failure degrades to no displacement, loudly.
+            std::optional<PrintMan::OslDisplaceShader> osl;
+            if (! volume.printman_scene->osl_shader.empty()) {
+                try {
+                    osl.emplace(PRINTMAN_OSL_SHADER_DIR, volume.printman_scene->osl_shader);
+                    disp.eval          = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n) { return (*osl)(p, n); };
+                    disp.max_magnitude = volume.printman_scene->osl_max_displacement;
+                } catch (const std::exception &e) {
+                    BOOST_LOG_TRIVIAL(error) << "PrintMan: could not load OSL shader '"
+                        << volume.printman_scene->osl_shader << "': " << e.what()
+                        << "; slicing without displacement.";
+                }
+            }
+#endif
+            layers = PrintMan::slice_scene(*volume.printman_scene, params2, zs, throw_on_cancel_callback, report_progress, disp);
             throw_on_cancel_callback();
         } else {
             indexed_triangle_set its = volume.mesh().its;

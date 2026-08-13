@@ -1,0 +1,41 @@
+// Grid (lattice) displacement, ported term-for-term from the built-in PrintMan::Gridwork +
+// Device (src/libslic3r/PrintMan/Displace.hpp). A raised 3D lattice: each axis is grooved with
+// pitch/groove, the vertical axis ramps at the self-supporting angle so it prints, and the pattern
+// retires (fills back to full depth) on faces nearly aligned with an axis so walls stay solid.
+// Parameterised by the same device settings as the C++, so it evaluates the identical algorithm
+// (float vs the C++ double only differs at the hard groove edges).
+shader printman_grid(
+    float LayerHeight    = 0.2,    // Device.layer_height (mm)
+    float ExtrusionWidth = 0.42,   // Device.extrusion_width (mm)
+    float DepthBeads     = 3.0,    // Gridwork.depth_beads
+    float Pitch          = 1.5,
+    float Groove         = 0.75,
+    float Phase          = 0.75,
+    int   Raised         = 1,
+    int   Printable      = 1,
+    output float Disp    = 0.0)
+{
+    float tan_a    = ExtrusionWidth / LayerHeight;          // tan(self_supporting_angle) = ew/lh
+    float asked    = DepthBeads * ExtrusionWidth;           // Device.beads(depth_beads)
+    float depth    = (Printable != 0) ? min(asked, 0.5 * Groove * tan_a) : asked;
+    float half_rib = 0.5 * (Pitch - Groove);
+    float retire_from = 0.9;
+
+    float per_axis[3];
+    for (int k = 0; k < 3; k = k + 1) {
+        float t    = (P[k] - Phase) / Pitch;
+        float frac = t - floor(t);
+        float dist = min(frac, 1.0 - frac) * Pitch;
+        if (k == 2 && Printable != 0)
+            per_axis[k] = clamp((dist - half_rib) * tan_a, 0.0, depth);   // vertical: self-supporting ramp
+        else
+            per_axis[k] = (dist > half_rib) ? depth : 0.0;               // horizontal: hard groove
+    }
+    for (int k = 0; k < 3; k = k + 1) {                                   // retire toward axis-aligned faces
+        float f      = clamp((abs(N[k]) - retire_from) / (1.0 - retire_from), 0.0, 1.0);
+        float retire = f * f * (3.0 - 2.0 * f);
+        per_axis[k]  = per_axis[k] * (1.0 - retire) + depth * retire;
+    }
+    float cut = min(per_axis[0], min(per_axis[1], per_axis[2]));
+    Disp = (Raised != 0) ? (depth - cut) : (0.0 - cut);
+}

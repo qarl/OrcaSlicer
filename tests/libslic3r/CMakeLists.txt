@@ -74,7 +74,7 @@ if (SLIC3R_OSL)
 
     # Compile each test shader to bytecode beside the test binary's build dir; the test reads them there.
     set(_osl_oso_dir "${CMAKE_CURRENT_BINARY_DIR}/osl_shaders")
-    set(_osl_shaders printman_test_disp printman_test_normal printman_test_hifreq)
+    set(_osl_shaders printman_test_disp printman_test_normal printman_test_hifreq printman_grid)
     set(_osl_oso_files "")
     foreach(_sh ${_osl_shaders})
         add_custom_command(

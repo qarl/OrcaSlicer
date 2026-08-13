@@ -1,0 +1,18 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# A subdivision cube carrying an OSL displacement shader: the importer reads printman:oslShader
+# (a compiled .oso on the shader searchpath) and printman:maxDisplacement (the declared bound, mm),
+# and the slicer displaces the refined surface by that shader. printman_grid = the built-in Gridwork.
+def Mesh "cube"
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-5, -5, 0), (5, -5, 0), (5, 5, 0), (-5, 5, 0), (-5, -5, 10), (5, -5, 10), (5, 5, 10), (-5, 5, 10)]
+    uniform token subdivisionScheme = "catmullClark"
+    custom string printman:oslShader = "printman_grid"
+    custom float printman:maxDisplacement = 0.7875
+}

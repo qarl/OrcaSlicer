@@ -695,6 +695,40 @@ if(SLIC3R_PROFILE)
     target_link_libraries(libslic3r PRIVATE Shiny)
 endif()
 
+# Optional OSL displacement shaders (dev/local; needs a from-source OpenShadingLanguage). Links OSL
+# into libslic3r so PrintObjectSlice can evaluate a user shader (read from the USD prim) at slice
+# time; every consumer -- the GUI, tests -- picks it up. OFF by default, so the normal build and CI
+# never touch OSL/LLVM. Runtime finds liboslexec via DYLD_LIBRARY_PATH at launch (no rpath wired).
+option(SLIC3R_OSL "Link OpenShadingLanguage for OSL displacement shaders (dev/local)" OFF)
+if (SLIC3R_OSL)
+    set(OSL_ROOT "$ENV{HOME}/tmp/osl/OpenShadingLanguage" CACHE PATH "From-source OpenShadingLanguage tree")
+    set(OSL_BREW "/opt/homebrew" CACHE PATH "Homebrew prefix providing OpenImageIO/Imath/fmt")
+    find_library(OSL_EXEC_LIB  oslexec          PATHS "${OSL_ROOT}/build/lib" NO_DEFAULT_PATH REQUIRED)
+    find_library(OSL_OIIO_LIB  OpenImageIO      PATHS "${OSL_BREW}/lib" REQUIRED)
+    find_library(OSL_OIIOU_LIB OpenImageIO_Util PATHS "${OSL_BREW}/lib" REQUIRED)
+    find_program(OSLC_BIN      oslc             PATHS "${OSL_ROOT}/build/bin" NO_DEFAULT_PATH REQUIRED)
+
+    # Compile the grid shader to bytecode; PrintObjectSlice loads it by name from this dir.
+    set(PRINTMAN_OSL_SHADER_DIR "${CMAKE_BINARY_DIR}/osl_shaders")
+    add_custom_command(
+        OUTPUT "${PRINTMAN_OSL_SHADER_DIR}/printman_grid.oso"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${PRINTMAN_OSL_SHADER_DIR}"
+        COMMAND "${OSLC_BIN}" -I"${OSL_ROOT}/src/shaders"
+                -o "${PRINTMAN_OSL_SHADER_DIR}/printman_grid.oso"
+                "${CMAKE_SOURCE_DIR}/tests/data/test_osl/printman_grid.osl"
+        DEPENDS "${CMAKE_SOURCE_DIR}/tests/data/test_osl/printman_grid.osl"
+        COMMENT "Compiling the OSL grid shader (oslc)")
+    add_custom_target(printman_osl_shaders ALL DEPENDS "${PRINTMAN_OSL_SHADER_DIR}/printman_grid.oso")
+    add_dependencies(libslic3r printman_osl_shaders)
+
+    target_include_directories(libslic3r SYSTEM PUBLIC
+        "${OSL_ROOT}/build/include" "${OSL_ROOT}/src/include"
+        "${OSL_BREW}/include" "${OSL_BREW}/opt/fmt/include")
+    target_link_libraries(libslic3r PUBLIC "${OSL_EXEC_LIB}" "${OSL_OIIO_LIB}" "${OSL_OIIOU_LIB}")
+    target_compile_definitions(libslic3r PUBLIC SLIC3R_OSL PRINTMAN_OSL_SHADER_DIR="${PRINTMAN_OSL_SHADER_DIR}")
+    message(STATUS "SLIC3R_OSL ON: libslic3r links ${OSL_EXEC_LIB}")
+endif()
+
 if (SLIC3R_PCH AND NOT SLIC3R_SYNTAXONLY)
     add_precompiled_header(libslic3r pchheader.hpp FORCEINCLUDE)
 endif ()
