@@ -6,8 +6,9 @@
 
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/FlushVolPredictor.hpp"   // FlushPredict::RGBColor
 #include "libslic3r/PrintMan/PrintManScene.hpp"
-#include "libslic3r/PrintMan/Displace.hpp"   // DisplaceShader
+#include "libslic3r/PrintMan/Displace.hpp"   // DisplaceShader, V3
 
 namespace Slic3r {
 struct MeshSlicingParamsEx;   // libslic3r/TriangleMeshSlicer.hpp
@@ -23,17 +24,32 @@ struct DisplacementField {
     explicit operator bool() const { return bool(eval) || bool(eval_d); }
 };
 
+// Optional surface-colour shader for the amplification engine: eval(point, normal, dPdx, dPdy) is the
+// linear-RGB colour of a refined surface point, quantized to `palette` (the loaded filament colours as
+// sRGB bytes; channel k = palette[k]). When set and slice_scene is given an out_segmentation, the scene
+// is classified per refined face and split into per-channel layer contours. Empty = single colour.
+struct ColorField {
+    std::function<V3(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy)> eval;
+    std::vector<FlushPredict::RGBColor> palette;
+    explicit operator bool() const { return bool(eval) && ! palette.empty(); }
+};
+
 // Slice an instanced scene into per-layer contours by amplifying one prototype through each
 // placement, unioned -- the N-instance geometry is never baked. Mirrors slice_mesh_ex so it
 // stands in at the slice_volume seam. Divergences from slicing one combined mesh: vase mode
 // keeps N largest contours, and closing_radius closes each instance before the union.
+// out_segmentation (when non-null AND a ColorField is given): filled with [layer][channel] contours,
+// channel k = color.palette[k]. Phase A assigns each layer wholly to its dominant channel; the merged
+// per-layer contours are returned as usual, unaffected by colour.
 std::vector<ExPolygons> slice_scene(
     const PrintManScene         &scene,
     const MeshSlicingParamsEx   &params,
     const std::vector<float>    &zs,
     const std::function<void()> &throw_on_cancel = [](){},
     const std::function<void(size_t, size_t)> &report_progress = {},
-    const DisplacementField     &displacement = {});
+    const DisplacementField     &displacement = {},
+    const ColorField            &color = {},
+    std::vector<std::vector<ExPolygons>> *out_segmentation = nullptr);
 
 }} // namespace Slic3r::PrintMan
 

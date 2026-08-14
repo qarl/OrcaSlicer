@@ -22,6 +22,7 @@
 #include "libslic3r/TriangleMesh.hpp"        // its_flip_triangles
 #include "libslic3r/TriangleMeshSlicer.hpp"  // slice_mesh_ex, MeshSlicingParamsEx
 #include "libslic3r/Format/USDSubdiv.hpp"    // build_cage, subdivide, refine_region, device_level
+#include "libslic3r/PrintMan/Palette.hpp"    // nearest_filament (colour quantization)
 
 namespace Slic3r { namespace PrintMan {
 
@@ -287,6 +288,33 @@ static size_t cage_band_count(const CageProto &cp, const MeshSlicingParamsEx &pa
     return (zs.size() + band_layers - 1) / band_layers;
 }
 
+// Colour classification (Phase A): tally per-layer per-channel coverage for one band's refined mesh.
+// Each face's linear-RGB colour is quantized to a filament channel (nearest_filament), and the face's
+// area is added to every layer its Z-span crosses. The band owns the layer rows [first, last), so its
+// writes into `weight` are disjoint from the other bands of the same placement.
+static void classify_band_colour(const indexed_triangle_set &its, const std::vector<float> &zs,
+                                 size_t first, size_t last, const ColorField &color,
+                                 std::vector<std::vector<double>> &weight)
+{
+    for (const auto &t : its.indices) {
+        const Vec3f &a = its.vertices[t[0]], &b = its.vertices[t[1]], &c = its.vertices[t[2]];
+        const V3 centroid{{(double(a.x()) + b.x() + c.x()) / 3.0,
+                           (double(a.y()) + b.y() + c.y()) / 3.0,
+                           (double(a.z()) + b.z() + c.z()) / 3.0}};
+        const V3 e1{{double(b.x()) - a.x(), double(b.y()) - a.y(), double(b.z()) - a.z()}};
+        const V3 e2{{double(c.x()) - a.x(), double(c.y()) - a.y(), double(c.z()) - a.z()}};
+        const int k = nearest_filament(color.eval(centroid, face_normal(a, b, c), e1, e2), color.palette);
+        if (k < 0)
+            continue;
+        const V3 cr{{e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]}};
+        const double area = 0.5 * std::sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+        const float  zlo  = std::min({a.z(), b.z(), c.z()}), zhi = std::max({a.z(), b.z(), c.z()});
+        for (size_t L = first; L < last; ++ L)
+            if (zs[L] >= zlo && zs[L] <= zhi)
+                weight[L][size_t(k)] += area;
+    }
+}
+
 // Slice one placement of a subdivision cage in Z-bands. The cage is refined to a device-perfect level
 // for this placement's world scale. Per band, only faces whose limit reaches it are refined -- a
 // Catmull-Clark child never leaves its face's 1-ring hull, so a face is selected by that hull's
@@ -297,7 +325,9 @@ static void slice_cage_placement(const CageProto &cp,
                                  const std::function<void()> &throw_on_cancel,
                                  std::vector<ExPolygons> &out_local,
                                  const std::function<void()> &on_band,
-                                 const DisplacementField &displacement)
+                                 const DisplacementField &displacement,
+                                 const ColorField &color,
+                                 std::vector<std::vector<double>> *weight_local)
 {
     const usd_subdiv::Cage &cage = cp.cage;
     assert(cp.scheme == "catmullClark");   // build_cage_protos engages a CageProto only for CC cages
@@ -392,6 +422,8 @@ static void slice_cage_placement(const CageProto &cp,
             const std::vector<float> band_zs(zs.begin() + first, zs.begin() + last);
             std::vector<ExPolygons>  sub = slice_mesh_ex(its, band_zs, p, throw_on_cancel);
             accumulate_sections(out_local, first, sub);
+            if (color && weight_local)
+                classify_band_colour(its, zs, first, last, color, *weight_local);
             throw_on_cancel();
         }
         if (on_band) on_band();   // one band done -- advance the status bar (see slice_scene)
@@ -416,7 +448,9 @@ std::vector<ExPolygons> slice_scene(
     const std::vector<float>    &zs,
     const std::function<void()> &throw_on_cancel,
     const std::function<void(size_t, size_t)> &report_progress,
-    const DisplacementField     &displacement)
+    const DisplacementField     &displacement,
+    const ColorField            &color,
+    std::vector<std::vector<ExPolygons>> *out_segmentation)
 {
     // Slice placements in parallel into thread-local per-layer buckets, merged at the end. Union is
     // associative and idempotent, so the result matches serial order.
@@ -457,17 +491,26 @@ std::vector<ExPolygons> slice_scene(
         }
     };
 
+    // Colour (Phase A): per-layer per-channel coverage weight, thread-local like the contours and
+    // merged into out_segmentation below. Only built when both a ColorField and an out sink are given;
+    // plain-mesh placements are not classified (colour targets the amplified cage surface).
+    const bool   do_color = bool(color) && out_segmentation != nullptr;
+    const size_t npal     = color.palette.size();
+    tbb::enumerable_thread_specific<std::vector<std::vector<double>>> tls_weight(
+        [&]{ return std::vector<std::vector<double>>(zs.size(), std::vector<double>(npal, 0.0)); });
+
     // Slice each placement: a cage through slice_cage_placement (Z-bands), a plain mesh through
     // slice_placement. A single large cage's parallelism comes from its bands; an instanced scene's
     // from the placements themselves (nested band parallelism then just fills any remaining cores).
     tbb::parallel_for(tbb::blocked_range<size_t>(0, nplace),
         [&](const tbb::blocked_range<size_t> &range) {
-            std::vector<ExPolygons> &out_local = tls.local();
+            std::vector<ExPolygons>          &out_local = tls.local();
+            std::vector<std::vector<double>> *wl        = do_color ? &tls_weight.local() : nullptr;
             for (size_t pi = range.begin(); pi < range.end(); ++ pi) {
                 const Placement &place = scene.placements[pi];
                 const int        proto = place.prototype;
                 if (proto >= 0 && size_t(proto) < cageprotos.size() && cageprotos[proto])
-                    slice_cage_placement(*cageprotos[proto], params, zs, place, throw_on_cancel, out_local, bump, displacement);
+                    slice_cage_placement(*cageprotos[proto], params, zs, place, throw_on_cancel, out_local, bump, displacement, color, wl);
                 else {
                     slice_placement(protos, params, zs, place, throw_on_cancel, out_local);
                     bump();
@@ -496,6 +539,28 @@ std::vector<ExPolygons> slice_scene(
                     out[L] = union_ex(out[L]);
             throw_on_cancel();
         });
+
+    // Colour (Phase A): merge the per-thread coverage weights and assign each layer wholly to its
+    // dominant filament channel -- the layer's own contour goes to that channel, the rest stay empty.
+    // A layer with no colour weight (e.g. covered only by an unclassified plain mesh) is left
+    // unassigned; the consumer keeps such a layer on the default filament rather than dropping it.
+    // A within-layer area partition (real per-face colour patterns) is the follow-up (Phase B).
+    if (do_color) {
+        std::vector<std::vector<double>> weight(zs.size(), std::vector<double>(npal, 0.0));
+        for (const std::vector<std::vector<double>> &wloc : tls_weight)
+            for (size_t L = 0; L < zs.size(); ++ L)
+                for (size_t k = 0; k < npal; ++ k)
+                    weight[L][k] += wloc[L][k];
+        out_segmentation->assign(zs.size(), std::vector<ExPolygons>(npal));
+        for (size_t L = 0; L < zs.size(); ++ L) {
+            size_t winner = 0;
+            double best   = 0.0;
+            for (size_t k = 0; k < npal; ++ k)
+                if (weight[L][k] > best) { best = weight[L][k]; winner = k; }
+            if (best > 0.0 && ! out[L].empty())
+                (*out_segmentation)[L][winner] = out[L];
+        }
+    }
 
     return out;
 }

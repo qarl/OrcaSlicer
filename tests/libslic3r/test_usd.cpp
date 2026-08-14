@@ -90,6 +90,74 @@ SCENARIO("PrintMan quantizes a surface colour to the nearest filament", "[PrintM
     }
 }
 
+// Amplification colour (Phase A, engine): slice a cage with a ColorField whose Cout is red below the
+// mid-Z and blue above. The engine classifies each refined face and hands back [layer][channel]
+// contours; each layer is assigned wholly to its dominant channel. Assert the split follows the shader
+// in Z (bottom third red = channel 0, top third blue = channel 1) with exactly one channel per layer.
+// Uses a C++ colour lambda -- no OSL, always built.
+SCENARIO_METHOD(UsdResourcesFixture, "The engine splits an amplified scene into per-filament layers", "[usd][subdiv][PrintMan][color]")
+{
+    GIVEN("a subdivision cube coloured red (low Z) / blue (high Z) over a 2-filament palette") {
+        Model       model;
+        std::string message;
+        REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, true));
+        const ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+
+        const Transform3d m = vol->get_matrix();
+        float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+        for (const Vec3f &v : vol->mesh().its.vertices) {
+            const float z = float((m * v.cast<double>()).z());
+            zmin = std::min(zmin, z);
+            zmax = std::max(zmax, z);
+        }
+        std::vector<float> zs;
+        for (float z = zmin + 0.1f; z < zmax - 1e-4f; z += 0.2f)
+            zs.push_back(z);
+        REQUIRE(zs.size() > 10);
+
+        MeshSlicingParamsEx params;
+        params.trafo      = m;
+        params.subdiv_tol = 0.05;
+
+        const double zmid = 0.5 * (double(zs.front()) + zs.back());
+        PrintMan::ColorField color;
+        color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
+        color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+            return p[2] < zmid ? PrintMan::V3{{1, 0, 0}} : PrintMan::V3{{0, 0, 1}};
+        };
+
+        std::vector<std::vector<ExPolygons>> seg;
+        const std::vector<ExPolygons>        layers =
+            PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color, &seg);
+
+        REQUIRE(layers.size() == zs.size());
+        REQUIRE(seg.size()    == zs.size());
+
+        auto area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+
+        THEN("each non-empty layer is one channel, and the split follows the shader in Z") {
+            const double lo3 = double(zs.front()) + (double(zs.back()) - zs.front()) / 3.0;
+            const double hi3 = double(zs.back())  - (double(zs.back()) - zs.front()) / 3.0;
+            size_t red_layers = 0, blue_layers = 0;
+            for (size_t L = 0; L < zs.size(); ++ L) {
+                REQUIRE(seg[L].size() == 2);
+                const bool has_red  = area(seg[L][0]) > 0.0;
+                const bool has_blue = area(seg[L][1]) > 0.0;
+                if (layers[L].empty()) { REQUIRE_FALSE(has_red); REQUIRE_FALSE(has_blue); continue; }
+                REQUIRE(has_red != has_blue);                                             // one channel/layer
+                REQUIRE(area(seg[L][has_red ? 0 : 1]) == Catch::Approx(area(layers[L]))); // the whole layer
+                if (has_red)  ++ red_layers;
+                if (has_blue) ++ blue_layers;
+                if (zs[L] < lo3) REQUIRE(has_red);    // clearly-low layers  -> red  (channel 0)
+                if (zs[L] > hi3) REQUIRE(has_blue);   // clearly-high layers -> blue (channel 1)
+            }
+            REQUIRE(red_layers  > 0);
+            REQUIRE(blue_layers > 0);
+        }
+    }
+}
+
 SCENARIO_METHOD(UsdResourcesFixture, "A displacement shader moves the sliced surface", "[usd][subdiv][PrintMan][displace]")
 {
     GIVEN("a subdivision cube sliced with and without a raised Gridwork displacement") {
