@@ -2,7 +2,7 @@
 #define slic3r_PrintMan_Displace_hpp_
 
 // Displacement shading for the amplification engine: a shader moves each refined surface
-// vertex along its normal. Zero-dependency std (like USDSubdiv.hpp), ported from and
+// vertex along its normal. Ported from and (apart from a TBB parallel reduce below)
 // validated bit-for-bit against printman/shade.py (Device/Gridwork/Noise) and mesh.py
 // (mesh.py). See the PrintMan design docs for the model and the per-face-average vertex rule.
 // NOTE: normals are computed per-band (on each band's core mesh), so across band seams continuity
@@ -15,6 +15,9 @@
 #include <cstdint>
 #include <functional>
 #include <vector>
+
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 #include "libslic3r/TriangleMesh.hpp"  // indexed_triangle_set
 
@@ -120,21 +123,36 @@ inline V3 face_normal(const Vec3f &a, const Vec3f &b, const Vec3f &c) {
 // dPdy)` yields a Vec3; accumulate onto each vertex, then divide by the incident-face count. One
 // averaged Vec3 per vertex. Generic so it serves displacement (a d*n vector) now and colour later.
 // Validated against tools/gen_reduce_golden.py.
+//
+// contrib (the shader) dominates a displaced slice, so it is evaluated per (face, corner) in parallel
+// and stored, then accumulated serially in face order -- bit-for-bit identical to the scalar reduction
+// (add order unchanged, contrib pure). Writes only function-local state, so it is safe to nest inside
+// the band parallel_for.
 template <typename Contrib>
 inline std::vector<V3> per_face_average(const indexed_triangle_set &its, const Contrib &contrib) {
+    const size_t nf = its.indices.size();
+    std::vector<std::array<V3, 3>> fc(nf);   // contrib per (face, corner); written once, disjoint slots
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, nf), [&](const tbb::blocked_range<size_t> &r) {
+        for (size_t f = r.begin(); f < r.end(); ++f) {
+            const auto &t = its.indices[f];
+            const Vec3f &a = its.vertices[t[0]], &b = its.vertices[t[1]], &c = its.vertices[t[2]];
+            const V3 fn = face_normal(a, b, c);
+            // The two edges from vertex 0 span the triangle -- they ARE dP across it, i.e. the local
+            // sample footprint. Passed to contrib as the shading derivatives (dPdx/dPdy).
+            const V3 e1{{double(b.x()) - a.x(), double(b.y()) - a.y(), double(b.z()) - a.z()}};
+            const V3 e2{{double(c.x()) - a.x(), double(c.y()) - a.y(), double(c.z()) - a.z()}};
+            for (int k = 0; k < 3; ++k) {
+                const Vec3f &vk = its.vertices[t[k]];
+                fc[f][k] = contrib(V3{{double(vk.x()), double(vk.y()), double(vk.z())}}, fn, e1, e2);
+            }
+        }
+    });
     std::vector<V3>  accum(its.vertices.size(), V3{{0, 0, 0}});
     std::vector<int> count(its.vertices.size(), 0);
-    for (const auto &t : its.indices) {
-        const Vec3f &a = its.vertices[t[0]], &b = its.vertices[t[1]], &c = its.vertices[t[2]];
-        const V3 fn = face_normal(a, b, c);
-        // The two edges from vertex 0 span the triangle -- they ARE dP across it, i.e. the local
-        // sample footprint. Passed to contrib as the shading derivatives (dPdx/dPdy).
-        const V3 e1{{double(b.x()) - a.x(), double(b.y()) - a.y(), double(b.z()) - a.z()}};
-        const V3 e2{{double(c.x()) - a.x(), double(c.y()) - a.y(), double(c.z()) - a.z()}};
+    for (size_t f = 0; f < nf; ++f) {
+        const auto &t = its.indices[f];
         for (int k = 0; k < 3; ++k) {
-            const Vec3f &vk = its.vertices[t[k]];
-            const V3 cc = contrib(V3{{double(vk.x()), double(vk.y()), double(vk.z())}}, fn, e1, e2);
-            accum[t[k]][0] += cc[0]; accum[t[k]][1] += cc[1]; accum[t[k]][2] += cc[2];
+            accum[t[k]][0] += fc[f][k][0]; accum[t[k]][1] += fc[f][k][1]; accum[t[k]][2] += fc[f][k][2];
             ++count[t[k]];
         }
     }

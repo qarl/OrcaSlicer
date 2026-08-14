@@ -34,10 +34,6 @@ static constexpr int kSubdivLevel = 2;
 static constexpr size_t kMinLayersPerBand = 16;
 static constexpr size_t kMaxLayersPerBand = 256;
 
-// Independent bands sliced in parallel, at most this many live per placement -- the peak-geometry
-// bound (fewer when instanced placements already fill the thread pool). Tune down for tighter memory.
-static constexpr size_t kMaxConcurrentBands = 8;
-
 // Sections per layer at which a bucket is unioned down, bounding peak memory to ~(workers * cap).
 static constexpr size_t kBucketCap = 64;
 
@@ -401,19 +397,16 @@ static void slice_cage_placement(const CageProto &cp,
         if (on_band) on_band();   // one band done -- advance the status bar (see slice_scene)
     };
 
-    // Slice bands in parallel, kMaxConcurrentBands per chunk so at most that many are live (peak-memory
-    // bound); slice_mesh_ex still parallelizes within a band. isolate() is required: out_local is a
-    // thread-keyed enumerable_thread_specific slot, and without it a worker blocked here could steal
-    // another placement's outer task, bind it to this thread's slot, and race this placement's bands.
+    // Slice all bands in one parallel_for so TBB load-balances the whole pool (bands are very uneven).
+    // Peak live bands is now bounded by the worker count, not a fixed cap -- a memory/throughput trade.
+    // isolate() is required: out_local is a thread-keyed ETS slot; without it a blocked worker could
+    // steal another placement's outer task and race this placement's bands.
     tbb::this_task_arena::isolate([&] {
-        for (size_t g = 0; g < band_ranges.size(); g += kMaxConcurrentBands) {
-            const size_t gend = std::min(g + kMaxConcurrentBands, band_ranges.size());
-            tbb::parallel_for(tbb::blocked_range<size_t>(g, gend, 1),
-                [&](const tbb::blocked_range<size_t> &r) {
-                    for (size_t bi = r.begin(); bi < r.end(); ++ bi)
-                        slice_band(band_ranges[bi].first, band_ranges[bi].second);
-                });
-        }
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, band_ranges.size(), 1),
+            [&](const tbb::blocked_range<size_t> &r) {
+                for (size_t bi = r.begin(); bi < r.end(); ++ bi)
+                    slice_band(band_ranges[bi].first, band_ranges[bi].second);
+            });
     });
 }
 
