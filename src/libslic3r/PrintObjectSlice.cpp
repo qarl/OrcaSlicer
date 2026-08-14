@@ -84,7 +84,8 @@ static std::vector<ExPolygons> slice_volume(
     const std::vector<float>      &zs,
     const MeshSlicingParamsEx     &params,
     const std::function<void()>   &throw_on_cancel_callback,
-    const std::function<void(size_t, size_t)> &report_progress = {})
+    const std::function<void(size_t, size_t)> &report_progress = {},
+    std::vector<std::vector<ExPolygons>> *out_color_seg = nullptr)
 {
     std::vector<ExPolygons> layers;
     if (! zs.empty()) {
@@ -114,7 +115,24 @@ static std::vector<ExPolygons> slice_volume(
                 }
             }
 #endif
-            layers = PrintMan::slice_scene(*volume.printman_scene, params2, zs, throw_on_cancel_callback, report_progress, disp);
+            // Colour: classify each refined face into a filament channel so the scene splits into
+            // per-filament layer contours (out_color_seg). De-risk source (PRINTMAN_DEBUG_COLOR): a
+            // world-Z band over a synthetic 2-colour palette, run through the engine's real colour path
+            // -- the hardcoded split stands in for a shader's Cout until an OSL colour shader is wired.
+            // Channels map to scene.filaments in order.
+            PrintMan::ColorField color;
+            if (out_color_seg && ! volume.printman_scene->filaments.empty() && std::getenv("PRINTMAN_DEBUG_COLOR")) {
+                const double zmid = 0.5 * (double(zs.front()) + zs.back());
+                color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
+                color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+                    return p[2] < zmid ? PrintMan::V3{{1, 0, 0}} : PrintMan::V3{{0, 0, 1}};
+                };
+            }
+            std::vector<std::vector<ExPolygons>> color_seg;
+            layers = PrintMan::slice_scene(*volume.printman_scene, params2, zs, throw_on_cancel_callback, report_progress, disp,
+                                           color, color ? &color_seg : nullptr);
+            if (out_color_seg)
+                *out_color_seg = std::move(color_seg);
             throw_on_cancel_callback();
         } else {
             indexed_triangle_set its = volume.mesh().its;
@@ -255,10 +273,10 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                         for (; params.slicing_mode_normal_below_layer < zs.size() && zs[params.slicing_mode_normal_below_layer] < region_config.bottom_shell_thickness - EPSILON;
                             ++ params.slicing_mode_normal_below_layer);
                     }
-                    out.push_back({
-                        model_volume->id(),
-                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback, report_progress)
-                    });
+                    std::vector<std::vector<ExPolygons>> color_seg;
+                    std::vector<ExPolygons>              sl =
+                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback, report_progress, &color_seg);
+                    out.push_back({ model_volume->id(), std::move(sl), std::move(color_seg) });
                 }
             } else {
                 assert(! print_config.spiral_mode);
@@ -1241,6 +1259,18 @@ void PrintObject::slice_volumes()
             report_progress);
     }
 
+    // Amplified PrintMan colour: lift the engine's per-filament segmentation out of the first coloured
+    // volume before objSliceByVolume is consumed by slices_to_regions below (it is moved there).
+    std::vector<std::vector<ExPolygons>> printman_color_seg;
+    const ModelVolume                   *printman_colored = nullptr;
+    for (VolumeSlices &vs : objSliceByVolume)
+        if (! vs.printman_color_segmentation.empty()) {
+            for (const ModelVolume *v : this->model_object()->volumes)
+                if (v->id() == vs.volume_id) { printman_colored = v; break; }
+            printman_color_seg = std::move(vs.printman_color_segmentation);
+            break;
+        }
+
     //BBS: "model_part" volumes are grouded according to their connections
     //const auto           scaled_resolution = scaled<double>(print->config().resolution.value);
     //firstLayerObjSliceByVolume = findPartVolumes(objSliceByVolume, this->model_object()->volumes);
@@ -1293,30 +1323,21 @@ void PrintObject::slice_volumes()
     }
 
     // PrintMan colour: an amplified scene splits into the per-extruder regions PrintApply built from
-    // scene.filaments. TEMPORARY de-risk source = a hardcoded world-Z band (whole layers alternate
-    // filament, no shader) as plane-covering segments; the real per-face shader colour replaces this
-    // segmentation, keeping the same [layer][extruder-1] shape. apply_segmentation then rewrites the
-    // per-extruder LayerRegions exactly as the painted-facet path does.
-    if (m_print->config().filament_diameter.size() > 1 && ! m_layers.empty()) {
-        const ModelVolume *colored = nullptr;
-        for (const ModelVolume *v : this->model_object()->volumes)
-            if (v->printman_scene && ! v->printman_scene->filaments.empty()) { colored = v; break; }
-        if (colored) {
-            const size_t                     num_ext = m_print->config().filament_diameter.size();
-            const std::vector<unsigned int> &fil     = colored->printman_scene->filaments;
-            const double                     zmid    = 0.5 * (m_layers.front()->slice_z + m_layers.back()->slice_z);
-            const coord_t                    B       = scaled<coord_t>(1000.0);   // covers any bed
-            ExPolygons cover(1);
-            cover.front().contour.points = { Point(-B, -B), Point(B, -B), Point(B, B), Point(-B, B) };
-            std::vector<std::vector<ExPolygons>> seg(m_layers.size(), std::vector<ExPolygons>(num_ext));
-            for (size_t L = 0; L < m_layers.size(); ++ L) {
-                const unsigned int e = (m_layers[L]->slice_z < zmid) ? fil.front() : fil.back();
-                if (e >= 1 && e <= num_ext)
-                    seg[L][e - 1] = cover;
+    // scene.filaments. The engine classified each refined face's colour into per-channel layer contours
+    // (channel k = scene.filaments[k]); remap those to [layer][extruder-1] and apply_segmentation
+    // rewrites the per-extruder LayerRegions exactly as the painted-facet path does.
+    if (m_print->config().filament_diameter.size() > 1 && ! m_layers.empty() && printman_colored && ! printman_color_seg.empty()) {
+        const size_t                     num_ext = m_print->config().filament_diameter.size();
+        const std::vector<unsigned int> &fil     = printman_colored->printman_scene->filaments;
+        std::vector<std::vector<ExPolygons>> seg(m_layers.size(), std::vector<ExPolygons>(num_ext));
+        for (size_t L = 0; L < m_layers.size() && L < printman_color_seg.size(); ++ L)
+            for (size_t k = 0; k < fil.size() && k < printman_color_seg[L].size(); ++ k) {
+                const unsigned int e = fil[k];
+                if (e >= 1 && e <= num_ext && ! printman_color_seg[L][k].empty())
+                    seg[L][e - 1] = std::move(printman_color_seg[L][k]);   // channel k -> filament fil[k]
             }
-            BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - PrintMan colour segmentation";
-            apply_segmentation(*this, std::move(seg), [print]() { print->throw_if_canceled(); });
-        }
+        BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - PrintMan colour segmentation";
+        apply_segmentation(*this, std::move(seg), [print]() { print->throw_if_canceled(); });
     }
 
     // Is any ModelVolume fuzzy skin painted?

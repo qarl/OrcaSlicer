@@ -48,6 +48,9 @@ struct VolumeSlices
 {
     ObjectID                volume_id;
     std::vector<ExPolygons> slices;
+    // Amplified PrintMan colour: per-layer per-channel contours the engine produced for this volume
+    // (channel k = its printman_scene->filaments[k]). Empty unless the volume is a coloured scene.
+    std::vector<std::vector<ExPolygons>> printman_color_segmentation;
 };
 
 struct groupedVolumeSlices
