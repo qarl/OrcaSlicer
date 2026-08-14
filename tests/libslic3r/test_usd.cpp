@@ -222,6 +222,28 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers an intermediate colour 
                 REQUIRE(std::abs(a0 - a1) < 0.5 * (a0 + a1));   // neither dominates; ~50/50 for f=0.5
             }
         }
+        WHEN("three filaments are loaded and the target sits between two of them") {
+            // Yellow (linear midpoint of red & green) over a red/green/blue palette: the two nearest are
+            // red & green, so the dither must mix those and never reach for blue -- the N>2 "multicolor"
+            // path (two-nearest selection over the whole palette).
+            PrintMan::ColorField color3;
+            color3.palette     = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 255, 0), FlushPredict::RGBColor(0, 0, 255)};
+            color3.dither      = true;
+            color3.band_width  = 0.5;
+            color3.dither_cell = 0.5;
+            color3.eval        = [](const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+                return PrintMan::V3{{0.5, 0.5, 0.0}};   // red+green; blue is the odd one out
+            };
+            std::vector<std::vector<ExPolygons>> seg;
+            PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color3, &seg);
+            const double a0 = total(seg, 0), a1 = total(seg, 1), a2 = total(seg, 2);
+            THEN("the two relevant filaments dither and the irrelevant one is unused") {
+                REQUIRE(a0 > 0.0);          // red
+                REQUIRE(a1 > 0.0);          // green
+                REQUIRE(a2 == 0.0);         // blue never chosen -- not among the two nearest
+                REQUIRE(std::abs(a0 - a1) < 0.5 * (a0 + a1));
+            }
+        }
     }
 }
 
