@@ -366,7 +366,14 @@ static void slice_cage_placement(const CageProto &cp,
             if (flip_det)
                 its_flip_triangles(its);
             if (displacement) {   // move each refined vertex along its normal (world space)
-                const double moved = apply_displacement(its, displacement.eval);
+                // apply_displacement takes the footprint-aware form; a plain (point,normal) built-in
+                // is bridged by dropping the derivatives. The OSL path sets eval_d and gets them.
+                PrintMan::DisplaceShaderD shade;
+                if (displacement.eval_d)
+                    shade = displacement.eval_d;
+                else
+                    shade = [&displacement](const V3 &p, const V3 &n, const V3 &, const V3 &) { return displacement.eval(p, n); };
+                const double moved = apply_displacement(its, shade);
                 // The field MUST stay within max_magnitude: the band's face selection was grown by
                 // exactly that (above), so a larger move means faces that displaced into this band
                 // were never selected and are silently missing from the slice. Warn in release too

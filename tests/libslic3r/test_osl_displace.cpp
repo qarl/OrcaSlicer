@@ -285,4 +285,25 @@ SCENARIO_METHOD(OslDisplaceFixture, "Dump grid vs plain slices to SVG for viewin
     }
 }
 
+// Derivative propagation: OSL's filterwidth()/texture() band-limit using the sample footprint carried
+// in sg.dPdx/dPdy, which the wrapper must feed (see docs/OSL-INTEGRATION.md). deriv_probe.osl outputs
+// length(filterwidth(P)): a zero footprint -> ~0, a real footprint -> a matching positive width. Guards
+// the antialiasing/texture work; needs deriv_probe.oso on the searchpath (built by CMake under SLIC3R_OSL).
+SCENARIO("OSL displacement receives the sample footprint (derivatives)", "[osl]")
+{
+    OslDisplaceFixture fixture;
+    GIVEN("deriv_probe.osl, which outputs the world-space filter footprint of P") {
+        PrintMan::OslDisplaceShader probe(PRINTMAN_OSL_TEST_DIR, "deriv_probe", "Disp");
+        const PrintMan::V3 p{{1.0, 2.0, 3.0}}, n{{0.0, 0.0, 1.0}};
+        const PrintMan::V3 dPdx{{0.5, 0.0, 0.0}}, dPdy{{0.0, 0.5, 0.0}};
+        THEN("no footprint -> ~0 out; a real footprint -> a positive width") {
+            const double zero_fw = probe(p, n);              // 2-arg: dPdx/dPdy = 0
+            const double real_fw = probe(p, n, dPdx, dPdy);  // ~0.5 in x and y
+            INFO("zero_fw=" << zero_fw << "  real_fw=" << real_fw);
+            REQUIRE(zero_fw == Catch::Approx(0.0).margin(1e-6));
+            REQUIRE(real_fw > 0.1);
+        }
+    }
+}
+
 #endif // SLIC3R_OSL

@@ -1,0 +1,8 @@
+// Derivative-propagation probe (see docs/OSL-INTEGRATION.md, "Feed OSL the surface derivatives").
+// Outputs the world-space filter footprint of P, which is zero unless the renderer supplies the
+// sample derivatives sg.dPdx/dPdy. The [.deriv] test uses it to prove those derivatives reach the
+// shader -- the prerequisite for filterwidth()/texture()/antialiasing.
+shader deriv_probe(output float Disp = 0.0)
+{
+    Disp = length(filterwidth(P));
+}

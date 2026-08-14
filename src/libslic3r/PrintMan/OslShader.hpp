@@ -108,14 +108,26 @@ public:
         }
     }
 
-    // The DisplaceShader: (world point, unit normal) -> displacement mm. Thread-safe.
+    // The DisplaceShader: (world point, unit normal) -> displacement mm. Thread-safe. No sample
+    // footprint is supplied, so derivative-driven ops (filterwidth/texture) see a zero footprint.
     double operator()(const V3 &point, const V3 &normal) const
+    {
+        return (*this)(point, normal, V3{{0, 0, 0}}, V3{{0, 0, 0}});
+    }
+
+    // As above, plus the sample footprint as the world-space derivatives of P (dPdx/dPdy -- e.g. the
+    // refined face's two edge vectors), so OSL's filterwidth()/texture() can band-limit to it.
+    // Thread-safe: each thread has its own ShadingContext; sg is a local.
+    double operator()(const V3 &point, const V3 &normal,
+                      const V3 &dPdx, const V3 &dPdy) const
     {
         OSL::ShadingContext *ctx = context_for_this_thread();
 
         OSL::ShaderGlobals sg;
         std::memset((void *)&sg, 0, sizeof(sg));   // ShaderGlobals is POD-ish; testshade does the same
-        sg.P        = OSL::Vec3(float(point[0]),  float(point[1]),  float(point[2]));
+        sg.P        = OSL::Vec3(float(point[0]), float(point[1]), float(point[2]));
+        sg.dPdx     = OSL::Vec3(float(dPdx[0]),  float(dPdx[1]),  float(dPdx[2]));
+        sg.dPdy     = OSL::Vec3(float(dPdy[0]),  float(dPdy[1]),  float(dPdy[2]));
         sg.N        = OSL::Vec3(float(normal[0]), float(normal[1]), float(normal[2]));
         sg.Ng       = sg.N;
         sg.renderer = const_cast<Renderer *>(&m_rend);

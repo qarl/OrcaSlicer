@@ -17,9 +17,10 @@ namespace PrintMan {
 // vertex along its normal by eval(world_point, unit_normal) mm. max_magnitude bounds |eval| so
 // the band loop can grow its face selection. Empty (the default) leaves the existing path.
 struct DisplacementField {
-    DisplaceShader eval;
-    double         max_magnitude = 0.0;
-    explicit operator bool() const { return bool(eval); }
+    DisplaceShader  eval;      // (point, normal) -- built-in C++ shaders
+    DisplaceShaderD eval_d;    // (point, normal, dPdx, dPdy) -- footprint-aware (OSL); preferred if set
+    double          max_magnitude = 0.0;
+    explicit operator bool() const { return bool(eval) || bool(eval_d); }
 };
 
 // Slice an instanced scene into per-layer contours by amplifying one prototype through each

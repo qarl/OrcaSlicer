@@ -104,7 +104,8 @@ static std::vector<ExPolygons> slice_volume(
             if (! volume.printman_scene->osl_shader.empty()) {
                 try {
                     osl.emplace(PRINTMAN_OSL_SHADER_DIR, volume.printman_scene->osl_shader);
-                    disp.eval          = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n) { return (*osl)(p, n); };
+                    disp.eval_d        = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
+                                                const PrintMan::V3 &dPdx, const PrintMan::V3 &dPdy) { return (*osl)(p, n, dPdx, dPdy); };
                     disp.max_magnitude = volume.printman_scene->osl_max_displacement;
                 } catch (const std::exception &e) {
                     BOOST_LOG_TRIVIAL(error) << "PrintMan: could not load OSL shader '"

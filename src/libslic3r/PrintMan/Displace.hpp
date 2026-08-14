@@ -25,6 +25,12 @@ using V3 = std::array<double, 3>;
 // A shader is (world point, unit normal) -> displacement in mm, +out along the normal.
 using DisplaceShader = std::function<double(const V3 &point, const V3 &normal)>;
 
+// As above, plus the world-space sample footprint as the derivatives of P (dPdx/dPdy -- the refined
+// face's two edges), so a shader can band-limit (filterwidth/texture). apply_displacement always calls
+// this form; a plain DisplaceShader is bridged to it by ignoring the derivatives.
+using DisplaceShaderD = std::function<double(const V3 &point, const V3 &normal,
+                                             const V3 &dPdx, const V3 &dPdy)>;
+
 // ---- ported displacement shaders (printman/shade.py) --------------------------------------
 
 struct Device {
@@ -110,20 +116,25 @@ inline V3 face_normal(const Vec3f &a, const Vec3f &b, const Vec3f &c) {
     return len > 0.0 ? V3{{w[0] / len, w[1] / len, w[2] / len}} : V3{{0, 0, 0}};
 }
 
-// Per-face-average primvar reducer: for each triangle, `contrib(vertex_pos, unit_face_normal)`
-// yields a Vec3; accumulate onto each of the triangle's vertices, then divide by the
-// incident-face count. One averaged Vec3 per vertex. Generic so it serves displacement (a d*n
-// vector) now and colour later. Validated against tools/gen_reduce_golden.py.
+// Per-face-average primvar reducer: for each triangle, `contrib(vertex_pos, unit_face_normal, dPdx,
+// dPdy)` yields a Vec3; accumulate onto each vertex, then divide by the incident-face count. One
+// averaged Vec3 per vertex. Generic so it serves displacement (a d*n vector) now and colour later.
+// Validated against tools/gen_reduce_golden.py.
 template <typename Contrib>
 inline std::vector<V3> per_face_average(const indexed_triangle_set &its, const Contrib &contrib) {
     std::vector<V3>  accum(its.vertices.size(), V3{{0, 0, 0}});
     std::vector<int> count(its.vertices.size(), 0);
     for (const auto &t : its.indices) {
-        const V3 fn = face_normal(its.vertices[t[0]], its.vertices[t[1]], its.vertices[t[2]]);
+        const Vec3f &a = its.vertices[t[0]], &b = its.vertices[t[1]], &c = its.vertices[t[2]];
+        const V3 fn = face_normal(a, b, c);
+        // The two edges from vertex 0 span the triangle -- they ARE dP across it, i.e. the local
+        // sample footprint. Passed to contrib as the shading derivatives (dPdx/dPdy).
+        const V3 e1{{double(b.x()) - a.x(), double(b.y()) - a.y(), double(b.z()) - a.z()}};
+        const V3 e2{{double(c.x()) - a.x(), double(c.y()) - a.y(), double(c.z()) - a.z()}};
         for (int k = 0; k < 3; ++k) {
             const Vec3f &vk = its.vertices[t[k]];
-            const V3 c = contrib(V3{{double(vk.x()), double(vk.y()), double(vk.z())}}, fn);
-            accum[t[k]][0] += c[0]; accum[t[k]][1] += c[1]; accum[t[k]][2] += c[2];
+            const V3 cc = contrib(V3{{double(vk.x()), double(vk.y()), double(vk.z())}}, fn, e1, e2);
+            accum[t[k]][0] += cc[0]; accum[t[k]][1] += cc[1]; accum[t[k]][2] += cc[2];
             ++count[t[k]];
         }
     }
@@ -136,9 +147,9 @@ inline std::vector<V3> per_face_average(const indexed_triangle_set &its, const C
 // watertight (one position per shared vertex, no crack), faithful to normal-dependent shaders
 // (each face's real orientation), and auto-damping at edges (the averaged vector shrinks where
 // the incident normals diverge). Returns max |displacement|.
-inline double apply_displacement(indexed_triangle_set &its, const DisplaceShader &shader) {
-    const std::vector<V3> dv = per_face_average(its, [&](const V3 &p, const V3 &n) {
-        const double d = shader(p, n);
+inline double apply_displacement(indexed_triangle_set &its, const DisplaceShaderD &shader) {
+    const std::vector<V3> dv = per_face_average(its, [&](const V3 &p, const V3 &n, const V3 &dPdx, const V3 &dPdy) {
+        const double d = shader(p, n, dPdx, dPdy);
         return V3{{d * n[0], d * n[1], d * n[2]}};
     });
     double maxd = 0.0;
