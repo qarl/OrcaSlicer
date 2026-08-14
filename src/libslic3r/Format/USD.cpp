@@ -1010,6 +1010,11 @@ indexed_triangle_set scene_proxy_boxes(const PrintMan::PrintManScene &scene)
                 lo = lo.cwiseMin(w); hi = hi.cwiseMax(w);
             }
         }
+        // Grow the Z envelope up by the shader's max outward displacement so raised top caps get sliced;
+        // leave the bottom on the AABB (downward caps clip against the bed, and dropping lo.z would sit
+        // the object on sub-width rib tips -> empty first layer).
+        if (const double md = scene.osl_max_displacement; md > 0.0)
+            hi.z() += md;
         const indexed_triangle_set b = box_its(lo.cast<float>(), hi.cast<float>());
         const int base = int(merged.vertices.size());
         merged.vertices.insert(merged.vertices.end(), b.vertices.begin(), b.vertices.end());
