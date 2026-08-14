@@ -1,0 +1,11 @@
+// Colour test shader: unlike the displacement shaders, this returns an `output color Cout` (linear
+// RGB) alongside a float Disp -- the two are independent outputs of one shader. Cout = color(P) and
+// Disp = P[2], so test_osl_displace.cpp reads a known colour back at a known point (the M2 proof that
+// a surface shader's colour reaches the wrapper). Trivial and position-driven for exact assertions.
+shader printman_test_color(
+    output color Cout = color(0, 0, 0),
+    output float Disp = 0.0)
+{
+    Cout = color(P[0], P[1], P[2]);
+    Disp = P[2];
+}

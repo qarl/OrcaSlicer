@@ -306,4 +306,42 @@ SCENARIO("OSL displacement receives the sample footprint (derivatives)", "[osl]"
     }
 }
 
+// Surface colour: a shader can return an `output color Cout` (linear RGB) as well as, or instead of,
+// the float Disp -- both resolved from one shader, read per point. printman_test_color.osl sets
+// Cout = color(P) and Disp = P[2], so a known point reads back a known colour. This is the M2 "shader
+// colour out" step: it proves a surface shader's colour reaches the wrapper, feeding the (separately
+// proven) per-filament sink. Needs printman_test_color.oso on the searchpath (built by CMake).
+SCENARIO("OSL shader returns a surface colour (Cout)", "[osl][color]")
+{
+    OslDisplaceFixture fixture;
+    GIVEN("printman_test_color.osl: Cout = color(P), Disp = P[2]") {
+        PrintMan::OslDisplaceShader sh(PRINTMAN_OSL_TEST_DIR, "printman_test_color");
+        const PrintMan::V3 n{{0.0, 0.0, 1.0}};
+        THEN("it declares a colour output that reads back the shaded RGB per point") {
+            REQUIRE(sh.has_color());
+            const PrintMan::V3 c0 = sh.color(PrintMan::V3{{0.1, 0.2, 0.3}}, n);
+            INFO("c0 = " << c0[0] << ", " << c0[1] << ", " << c0[2]);
+            REQUIRE(c0[0] == Catch::Approx(0.1).margin(1e-5));
+            REQUIRE(c0[1] == Catch::Approx(0.2).margin(1e-5));
+            REQUIRE(c0[2] == Catch::Approx(0.3).margin(1e-5));
+            // A different point gives a different colour -- P really drives the shader.
+            const PrintMan::V3 c1 = sh.color(PrintMan::V3{{0.7, 0.4, 0.9}}, n);
+            REQUIRE(c1[0] == Catch::Approx(0.7).margin(1e-5));
+            // ...and the same shader's displacement output still reads (one eval, two outputs).
+            REQUIRE(sh(PrintMan::V3{{0.1, 0.2, 0.3}}, n) == Catch::Approx(0.3).margin(1e-5));
+        }
+    }
+    GIVEN("a displacement-only shader (printman_test_disp)") {
+        PrintMan::OslDisplaceShader disp_only(PRINTMAN_OSL_TEST_DIR, "printman_test_disp");
+        THEN("it reports no colour output, and color() is a benign zero") {
+            REQUIRE_FALSE(disp_only.has_color());
+            const PrintMan::V3 c = disp_only.color(PrintMan::V3{{1, 2, 3}}, PrintMan::V3{{0, 0, 1}});
+            REQUIRE(c[0] == 0.0);
+            REQUIRE(c[1] == 0.0);
+            REQUIRE(c[2] == 0.0);
+            REQUIRE(disp_only(PrintMan::V3{{1, 2, 3}}, PrintMan::V3{{0, 0, 1}}) > 0.0);
+        }
+    }
+}
+
 #endif // SLIC3R_OSL

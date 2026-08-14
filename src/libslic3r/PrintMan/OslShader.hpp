@@ -2,8 +2,11 @@
 #define slic3r_PrintMan_OslShader_hpp_
 
 // OslDisplaceShader -- a user-authored OSL shader behind the engine's DisplaceShader seam
-// (Displace.hpp): (world point, unit normal) -> displacement mm. A compiled .oso is loaded, its
-// output symbol resolved once, and each (P, N) is evaluated through OSL's ShadingSystem (LLVM-JIT).
+// (Displace.hpp): (world point, unit normal) -> displacement mm, and optionally a surface colour
+// (an `output color Cout`, linear RGB). A compiled .oso is loaded, its output symbols resolved once,
+// and each (P, N) is evaluated through OSL's ShadingSystem (LLVM-JIT). Displacement and colour are
+// independent outputs of the shader; each accessor runs the shader for the output it reads (there is
+// no shared per-point eval -- call once per output you need).
 //
 // This header is compiled ONLY where OSL is available (the SLIC3R_OSL end-to-end test); it is NOT
 // in libslic3r's source list, so the default build never sees the OSL headers. It slots behind the
@@ -43,11 +46,14 @@ class OslDisplaceShader {
     struct Ctx { OSL::PerThreadInfo *info = nullptr; OSL::ShadingContext *ctx = nullptr; };
 
 public:
-    // Load `shadername`.oso from `searchpath`, reading its `output` param (a float) each call.
+    // Load `shadername`.oso from `searchpath`, resolving its displacement output `disp_output` (a
+    // float) and, when the shader declares it, its colour output `color_output` (an OSL `color` = 3
+    // floats). At least one of the two must resolve; a shader may carry either or both.
     OslDisplaceShader(const std::string &searchpath,
                       const std::string &shadername,
-                      const std::string &output = "Disp")
-        : m_output(output), m_layer("layer1")
+                      const std::string &disp_output  = "Disp",
+                      const std::string &color_output = "Cout")
+        : m_output(disp_output), m_color_output(color_output), m_layer("layer1")
     {
         m_ss = new OSL::ShadingSystem(&m_rend, nullptr, &m_err);
         OSL::ustring sp(searchpath);
@@ -63,14 +69,15 @@ public:
         }
         m_ss->ShaderGroupEnd(*m_group);
 
-        // Mark the output as a renderer output or the optimizer folds it away, unreadable.
-        OSL::ustring outs[] = {m_output};
+        // Mark BOTH outputs as renderer outputs or the optimizer folds them away, unreadable. A name
+        // the shader does not declare simply resolves to a null symbol below (absent, not an error).
+        OSL::ustring outs[] = {m_output, m_color_output};
         m_ss->attribute(m_group.get(), "renderer_outputs",
-                        OIIO::TypeDesc(OIIO::TypeDesc::STRING, 1), &outs[0]);
+                        OIIO::TypeDesc(OIIO::TypeDesc::STRING, 2), &outs[0]);
 
-        // Resolve the output symbol ONCE. find_symbol needs an optimized group, so execute with
-        // run=false to set it up without running the shader (the testshade idiom). The ShaderSymbol
-        // is group-scoped -- reused across every thread's context via symbol_address.
+        // Resolve the output symbols ONCE. find_symbol needs an optimized group, so execute with
+        // run=false to set it up without running the shader (the testshade idiom). The ShaderSymbols
+        // are group-scoped -- reused across every thread's context via symbol_address.
         OSL::PerThreadInfo  *ti = m_ss->create_thread_info();
         OSL::ShadingContext *c  = m_ss->get_context(ti);
         OSL::ShaderGlobals   sg;
@@ -78,15 +85,22 @@ public:
         sg.renderer = &m_rend;
         m_ss->execute(*c, *m_group, sg, false);
         m_sym = m_ss->find_symbol(*m_group, m_layer, m_output);
-        const bool is_float = m_sym && m_ss->symbol_typedesc(m_sym).basetype == OIIO::TypeDesc::FLOAT;
+        if (m_sym && m_ss->symbol_typedesc(m_sym).basetype != OIIO::TypeDesc::FLOAT)
+            m_sym = nullptr;                                  // a non-float `Disp` is not a displacement
+        m_color_sym = m_ss->find_symbol(*m_group, m_layer, m_color_output);
+        if (m_color_sym) {
+            const OIIO::TypeDesc td = m_ss->symbol_typedesc(m_color_sym);
+            if (!(td.basetype == OIIO::TypeDesc::FLOAT && td.basevalues() == 3))
+                m_color_sym = nullptr;                        // any 3-float aggregate (color/vector/point)
+        }
         m_ss->release_context(c);
         m_ss->destroy_thread_info(ti);
-        if (!is_float) {
+        if (!m_sym && !m_color_sym) {
             m_group.reset();
             delete m_ss;
             m_ss = nullptr;
-            throw std::runtime_error("OSL shader '" + shadername + "' has no float output '" +
-                                     output + "'");
+            throw std::runtime_error("OSL shader '" + shadername + "' has neither a float '" +
+                                     disp_output + "' nor a colour '" + color_output + "' output");
         }
     }
 
@@ -117,12 +131,44 @@ public:
 
     // As above, plus the sample footprint as the world-space derivatives of P (dPdx/dPdy -- e.g. the
     // refined face's two edge vectors), so OSL's filterwidth()/texture() can band-limit to it.
-    // Thread-safe: each thread has its own ShadingContext; sg is a local.
+    // Thread-safe: each thread has its own ShadingContext; sg is a local. 0 if the shader has no
+    // displacement output (a colour-only shader).
     double operator()(const V3 &point, const V3 &normal,
                       const V3 &dPdx, const V3 &dPdy) const
     {
-        OSL::ShadingContext *ctx = context_for_this_thread();
+        if (!m_sym) return 0.0;
+        OSL::ShadingContext *ctx = run(point, normal, dPdx, dPdy);
+        const void *adr = m_ss->symbol_address(*ctx, m_sym);
+        return adr ? double(*reinterpret_cast<const float *>(adr)) : 0.0;
+    }
 
+    // True when the shader declares a colour output (an OSL `output color Cout`).
+    bool has_color() const { return m_color_sym != nullptr; }
+
+    // The shader's surface colour at (world point, unit normal): linear RGB, a PrintMan convention
+    // (OSL fixes no colour space). {0,0,0} if the shader has no colour output. Same thread-safety and
+    // footprint contract as operator(); like it, this runs the shader once -- colour and displacement
+    // do not share an eval, so read each output with its own call.
+    V3 color(const V3 &point, const V3 &normal) const
+    {
+        return color(point, normal, V3{{0, 0, 0}}, V3{{0, 0, 0}});
+    }
+    V3 color(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy) const
+    {
+        if (!m_color_sym) return V3{{0, 0, 0}};
+        OSL::ShadingContext *ctx = run(point, normal, dPdx, dPdy);
+        const void *adr = m_ss->symbol_address(*ctx, m_color_sym);
+        if (!adr) return V3{{0, 0, 0}};
+        const float *rgb = reinterpret_cast<const float *>(adr);
+        return V3{{double(rgb[0]), double(rgb[1]), double(rgb[2])}};
+    }
+
+private:
+    // Run the shader once for (point, normal, footprint) on this thread's ShadingContext; the caller
+    // then reads whichever resolved output symbol it wants off that context via symbol_address.
+    OSL::ShadingContext *run(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy) const
+    {
+        OSL::ShadingContext *ctx = context_for_this_thread();
         OSL::ShaderGlobals sg;
         std::memset((void *)&sg, 0, sizeof(sg));   // ShaderGlobals is POD-ish; testshade does the same
         sg.P        = OSL::Vec3(float(point[0]), float(point[1]), float(point[2]));
@@ -132,12 +178,9 @@ public:
         sg.Ng       = sg.N;
         sg.renderer = const_cast<Renderer *>(&m_rend);
         m_ss->execute(*ctx, *m_group, sg);
-
-        const void *adr = m_ss->symbol_address(*ctx, m_sym);
-        return adr ? double(*reinterpret_cast<const float *>(adr)) : 0.0;
+        return ctx;
     }
 
-private:
     OSL::ShadingContext *context_for_this_thread() const
     {
         const std::thread::id id = std::this_thread::get_id();
@@ -156,8 +199,10 @@ private:
     OIIO::ErrorHandler       m_err;
     OSL::ShadingSystem      *m_ss  = nullptr;
     OSL::ShaderGroupRef      m_group;
-    const OSL::ShaderSymbol *m_sym = nullptr;   // resolved once in the ctor, const thereafter
+    const OSL::ShaderSymbol *m_sym       = nullptr;   // displacement output; resolved once, const thereafter
+    const OSL::ShaderSymbol *m_color_sym = nullptr;   // colour output (null if the shader has none)
     OSL::ustring             m_output;
+    OSL::ustring             m_color_output;
     OSL::ustring             m_layer;
 
     mutable std::mutex                               m_mtx;
