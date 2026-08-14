@@ -3,6 +3,7 @@
 #include <tbb/parallel_for.h>
 
 #include "ClipperUtils.hpp"
+#include "Color.hpp"
 #include "ElephantFootCompensation.hpp"
 #include "Exception.hpp"
 #include "I18N.hpp"
@@ -85,6 +86,7 @@ static std::vector<ExPolygons> slice_volume(
     const MeshSlicingParamsEx     &params,
     const std::function<void()>   &throw_on_cancel_callback,
     const std::function<void(size_t, size_t)> &report_progress = {},
+    const std::vector<FlushPredict::RGBColor> *filament_colors = nullptr,
     std::vector<std::vector<ExPolygons>> *out_color_seg = nullptr)
 {
     std::vector<ExPolygons> layers;
@@ -116,17 +118,34 @@ static std::vector<ExPolygons> slice_volume(
             }
 #endif
             // Colour: classify each refined face into a filament channel so the scene splits into
-            // per-filament layer contours (out_color_seg). De-risk source (PRINTMAN_DEBUG_COLOR): a
-            // world-Z band over a synthetic 2-colour palette, run through the engine's real colour path
-            // -- the hardcoded split stands in for a shader's Cout until an OSL colour shader is wired.
-            // Channels map to scene.filaments in order.
+            // per-filament layer contours (out_color_seg). Channels map to scene.filaments in order.
             PrintMan::ColorField color;
-            if (out_color_seg && ! volume.printman_scene->filaments.empty() && std::getenv("PRINTMAN_DEBUG_COLOR")) {
-                const double zmid = 0.5 * (double(zs.front()) + zs.back());
-                color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
-                color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
-                    return p[2] < zmid ? PrintMan::V3{{1, 0, 0}} : PrintMan::V3{{0, 0, 1}};
-                };
+            if (out_color_seg && ! volume.printman_scene->filaments.empty()) {
+                const std::vector<unsigned int> &fil = volume.printman_scene->filaments;
+#ifdef SLIC3R_OSL
+                // A real surface-colour shader (an `output color Cout` on the USD prim) drives filament
+                // choice per face, quantized to the loaded filament colours for the scene's ids.
+                if (osl && osl->has_color() && filament_colors) {
+                    std::vector<FlushPredict::RGBColor> palette;
+                    for (unsigned int e : fil)
+                        if (e >= 1 && e <= filament_colors->size())
+                            palette.push_back((*filament_colors)[e - 1]);
+                    if (palette.size() == fil.size()) {
+                        color.palette = std::move(palette);
+                        color.eval    = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
+                                               const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return (*osl).color(p, n, dx, dy); };
+                    }
+                }
+#endif
+                // De-risk fallback (no colour shader): a world-Z red/blue band over a synthetic palette,
+                // so the colour path is still exercised. PRINTMAN_DEBUG_COLOR only; needs >= 2 filaments.
+                if (! color && std::getenv("PRINTMAN_DEBUG_COLOR") && fil.size() >= 2) {
+                    const double zmid = 0.5 * (double(zs.front()) + zs.back());
+                    color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
+                    color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+                        return p[2] < zmid ? PrintMan::V3{{1, 0, 0}} : PrintMan::V3{{0, 0, 1}};
+                    };
+                }
             }
             std::vector<std::vector<ExPolygons>> color_seg;
             layers = PrintMan::slice_scene(*volume.printman_scene, params2, zs, throw_on_cancel_callback, report_progress, disp,
@@ -249,6 +268,15 @@ static std::vector<VolumeSlices> slice_volumes_inner(
 
     // BBS
     const size_t num_extruders = print_config.filament_diameter.size();
+    // Decoded loaded filament palette (sRGB bytes, index = extruder-1) for amplified colour classification.
+    std::vector<FlushPredict::RGBColor> filament_palette;
+    filament_palette.reserve(print_config.filament_colour.values.size());
+    for (const std::string &hex : print_config.filament_colour.values) {
+        ColorRGB c;
+        filament_palette.push_back(decode_color(hex, c)
+            ? FlushPredict::RGBColor((unsigned char)(c.r() * 255.0f), (unsigned char)(c.g() * 255.0f), (unsigned char)(c.b() * 255.0f))
+            : FlushPredict::RGBColor(0, 0, 0));
+    }
     const bool   is_mm_painted = num_extruders > 1 && std::any_of(model_volumes.cbegin(), model_volumes.cend(), [](const ModelVolume *mv) { return mv->is_mm_painted(); });
     // BBS: don't do size compensation when slice volume.
     // Will handle contour and hole size compensation seperately later.
@@ -275,7 +303,7 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                     }
                     std::vector<std::vector<ExPolygons>> color_seg;
                     std::vector<ExPolygons>              sl =
-                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback, report_progress, &color_seg);
+                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback, report_progress, &filament_palette, &color_seg);
                     out.push_back({ model_volume->id(), std::move(sl), std::move(color_seg) });
                 }
             } else {
