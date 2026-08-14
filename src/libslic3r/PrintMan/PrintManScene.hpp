@@ -52,6 +52,11 @@ struct PrintManScene
     // relief is not clipped. Only honoured when the build links OSL (SLIC3R_OSL); empty = no displacement.
     std::string osl_shader;
     double      osl_max_displacement = 0.0;
+
+    // Colour: the 1-based filament ids this scene paints with. Empty = single-filament (no colour).
+    // When set, slice_scene also emits per-filament contours and the object is split into one print
+    // region per filament, reusing Orca's MMU region machinery (see apply_printman_mm_segmentation).
+    std::vector<unsigned int> filaments;
 };
 
 }} // namespace Slic3r::PrintMan

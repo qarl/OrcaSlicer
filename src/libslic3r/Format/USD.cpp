@@ -1042,6 +1042,10 @@ ModelVolume *add_scene_volume(Model *model, ModelObject *object, const std::stri
         shift.translate(-off);
         pl.xform = shift * pl.xform;
     }
+    // Colour de-risk (PRINTMAN_DEBUG_COLOR): declare two filaments so slice_scene emits per-filament
+    // contours and the object splits into two extruder regions -- a hardcoded Z-band two-tone, no shader.
+    if (std::getenv("PRINTMAN_DEBUG_COLOR"))
+        scene.filaments = {1, 2};
     volume->printman_scene = std::move(scene);
     return volume;
 }

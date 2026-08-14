@@ -7,6 +7,9 @@
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/MultiMaterialSegmentation.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 
 using namespace Slic3r;
 
@@ -54,4 +57,27 @@ TEST_CASE("Multi-material segmentation resolves the outer-wall line width", "[Mu
         REQUIRE_THAT(resolve_outer_wall_line_width(region_config, object_config, print_config),
                      Catch::Matchers::WithinAbs(c.expected, 1e-9));
     }
+}
+
+// The sink for shader-driven colour: a filament index per triangle written with TriangleSelector, handed
+// to the volume's mmu_segmentation_facets exactly as a hand paint would be, so the existing MMU slicer and
+// preview colour it. Here a stand-in pattern (alternating faces) two-tones a cube; the real driver is the
+// dither. set_facet works per original triangle, so this is the resolution the shipping paint gets.
+TEST_CASE("Programmatic paint two-tones a volume's MMU segmentation", "[MultiMaterialSegmentation][PrintMan]")
+{
+    Model        model;
+    ModelObject *obj = model.add_object();
+    obj->add_volume(make_cube(10.0, 10.0, 10.0));
+    ModelVolume *mv = obj->volumes.front();
+
+    TriangleSelector selector(mv->mesh());
+    const indexed_triangle_set &its = mv->mesh().its;
+    for (int f = 0; f < int(its.indices.size()); ++f)
+        selector.set_facet(f, (f % 2 == 0) ? EnforcerBlockerType::Extruder1 : EnforcerBlockerType::Extruder2);
+    mv->mmu_segmentation_facets.set(selector);
+
+    REQUIRE(mv->is_mm_painted());
+    REQUIRE(mv->mmu_segmentation_facets.has_facets(*mv, EnforcerBlockerType::Extruder1));
+    REQUIRE(mv->mmu_segmentation_facets.has_facets(*mv, EnforcerBlockerType::Extruder2));
+    REQUIRE_FALSE(mv->mmu_segmentation_facets.has_facets(*mv, EnforcerBlockerType::Extruder3));
 }

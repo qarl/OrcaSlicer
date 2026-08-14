@@ -10,6 +10,7 @@
 #include <Eigen/Dense>
 
 #include "libslic3r/Model.hpp"
+#include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Format/USD.hpp"
 #include "libslic3r/Format/USDSubdiv.hpp"
 #include "libslic3r/Utils.hpp"
@@ -1101,4 +1102,83 @@ TEST_CASE("The limit AABB captures a semi-sharp feature frozen past convergence"
     Pt lo, hi;
     refined_limit_aabb(cage, "catmullClark", kDeviceLevelMax, lo, hi);
     REQUIRE(std::abs(lo[2] - lo8) < 1e-3);   // the recorded AABB is the finest slice's, not the frozen -3
+}
+
+// Headless repro of the amplified-colour path (no GUI/OSL): an amplified scene declaring filaments must
+// build one print region per filament at model-apply, the same way painted facets do.
+SCENARIO_METHOD(UsdResourcesFixture, "PrintMan colour builds per-filament print regions", "[usd][printman][color]")
+{
+    ::setenv("PRINTMAN_DEBUG_COLOR", "1", 1);   // exactly what the GUI process carries
+    Model       model;
+    std::string message;
+    REQUIRE(load_usd(usd_path("cube_grid.usda").c_str(), &model, message, nullptr, true));
+    ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    REQUIRE(vol->printman_scene->filaments.size() == 2);   // the importer must set this from the env var
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));   // on the bed so apply keeps the object
+
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>{1.75, 1.75}));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(std::vector<std::string>{"#FF0000", "#0000FF"}));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));   // like the Kobra X
+
+    Print print;
+    print.apply(model, config);
+    REQUIRE(! print.objects().empty());
+
+    const PrintObject *po = print.objects().front();
+    for (size_t i = 0; i < po->num_printing_regions(); ++ i)
+        WARN("region " << i << " outer_wall_filament_id=" << po->printing_region(i).config().outer_wall_filament_id.value);
+    CHECK(po->num_printing_regions() > 1);   // base + one region per declared filament
+
+    // Slice, and confirm apply_segmentation actually distributes contours to BOTH filament regions.
+    try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+    po = print.objects().front();
+    std::vector<size_t> nonempty(po->num_printing_regions(), 0);
+    for (const Layer *ly : po->layers())
+        for (size_t i = 0; i < nonempty.size() && i < size_t(ly->region_count()); ++ i)
+            if (! ly->get_region(int(i))->slices.empty()) ++ nonempty[i];
+    for (size_t i = 0; i < nonempty.size(); ++ i)
+        WARN("region " << i << " nonempty_layers=" << nonempty[i]);
+    CHECK(nonempty[1] > 0);   // the upper-half filament-2 region must receive slices
+}
+
+// The GUI flow: the object is applied while the profile has one filament, then a second is added and the
+// plate re-sliced. Print::apply is incremental, so the per-filament regions must regenerate on that change.
+SCENARIO_METHOD(UsdResourcesFixture, "PrintMan colour regenerates regions when a filament is added", "[usd][printman][color]")
+{
+    ::setenv("PRINTMAN_DEBUG_COLOR", "1", 1);
+    Model       model;
+    std::string message;
+    REQUIRE(load_usd(usd_path("cube_grid.usda").c_str(), &model, message, nullptr, true));
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+
+    Print print;
+    {   // first apply with ONE filament (import before a second is added)
+        DynamicPrintConfig c; c.apply(FullPrintConfig::defaults());
+        c.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>{1.75}));
+        c.set_key_value("filament_colour",   new ConfigOptionStrings(std::vector<std::string>{"#FF0000"}));
+        print.apply(model, c);
+    }
+    try { print.process(); } catch (const std::exception &) {}   // slice at 1 filament, like a GUI auto-slice
+    {   // then re-apply with TWO (a filament was added, then re-slice)
+        DynamicPrintConfig c; c.apply(FullPrintConfig::defaults());
+        c.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>{1.75, 1.75}));
+        c.set_key_value("filament_colour",   new ConfigOptionStrings(std::vector<std::string>{"#FF0000", "#0000FF"}));
+        print.apply(model, c);
+    }
+    try { print.process(); } catch (const std::exception &) {}   // re-slice at 2 filaments (the GUI re-slice)
+    REQUIRE(! print.objects().empty());
+    const PrintObject *po = print.objects().front();
+    std::vector<size_t> nonempty(po->num_printing_regions(), 0);
+    for (const Layer *ly : po->layers())
+        for (size_t i = 0; i < nonempty.size() && i < size_t(ly->region_count()); ++ i)
+            if (! ly->get_region(int(i))->slices.empty()) ++ nonempty[i];
+    for (size_t i = 0; i < nonempty.size(); ++ i)
+        WARN("region " << i << " nonempty_layers=" << nonempty[i]);
+    REQUIRE(po->num_printing_regions() > 1);
+    CHECK(nonempty[1] > 0);   // the re-slice must fill the 2nd-filament region
 }

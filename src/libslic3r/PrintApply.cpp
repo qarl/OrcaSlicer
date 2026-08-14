@@ -745,6 +745,19 @@ int  print_region_ref_cnt(const PrintRegion &r) { return r.m_ref_cnt; }
 // Verify whether the PrintRegions of a PrintObject are still valid, possibly after updating the region configs.
 // Before region configs are updated, callback_invalidate() is called to possibly stop background processing.
 // Returns false if this object needs to be resliced because regions were merged or split.
+// The set of extruder ids for which painted (per-filament) regions currently exist, so an apply can tell
+// when that set changed -- a filament added/removed, or a PrintMan colour scene now declaring filaments.
+// verify_update_print_object_regions only re-checks EXISTING painted regions, never notices newly-needed
+// ones, so without this a grown painting-extruder set silently keeps the stale single-region slice.
+static bool painting_extruders_differ(const PrintObjectRegions &regions, const std::vector<unsigned int> &painting_extruders)
+{
+    std::set<unsigned int> have;
+    for (const PrintObjectRegions::LayerRangeRegions &lr : regions.layer_ranges)
+        for (const PrintObjectRegions::PaintedRegion &pr : lr.painted_regions)
+            have.insert(pr.extruder_id);
+    return have != std::set<unsigned int>(painting_extruders.begin(), painting_extruders.end());
+}
+
 bool verify_update_print_object_regions(
     ModelVolumePtrs                     model_volumes,
     const PrintRegionConfig            &default_region_config,
@@ -1838,6 +1851,14 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                     painting_extruders.emplace_back(state_idx);
             }
         }
+        // PrintMan colour: an amplified scene declares the filaments it paints with directly (no facets),
+        // so add them here and let the same machinery build one print region per filament.
+        if (num_extruders > 1)
+            for (const ModelVolume *volume : print_object.model_object()->volumes)
+                if (volume->printman_scene)
+                    for (unsigned int e : volume->printman_scene->filaments)
+                        if (e >= 1 && e <= num_extruders && std::find(painting_extruders.begin(), painting_extruders.end(), e) == painting_extruders.end())
+                            painting_extruders.emplace_back(e);   // clamp to loaded filaments; no out-of-range region
         if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid) {
             // Verify that the trafo for regions & volume bounding boxes thus for regions is still applicable.
             auto invalidate = [it_print_object, it_print_object_end, update_apply_status]() {
@@ -1845,7 +1866,15 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                     if ((*it)->m_shared_regions != nullptr)
                         update_apply_status((*it)->invalidate_all_steps());
             };
-            if (print_object_regions && ! trafos_differ_in_rotation_by_z_and_mirroring_by_xy_only(print_object_regions->trafo_bboxes, model_object_status.print_instances.front().trafo)) {
+            if (print_object_regions && painting_extruders_differ(*print_object_regions, painting_extruders)) {
+                // The painted-extruder set changed (a filament added/removed, or a PrintMan colour scene now
+                // declaring filaments) while no per-volume config did, so verify_update below would keep the
+                // stale region set. Reslice so the per-filament regions are (re)built from painting_extruders.
+                invalidate();
+                print_object_regions->clear();
+                model_object_status.print_object_regions_status = ModelObjectStatus::PrintObjectRegionsStatus::Invalid;
+                print_regions_reshuffled = true;
+            } else if (print_object_regions && ! trafos_differ_in_rotation_by_z_and_mirroring_by_xy_only(print_object_regions->trafo_bboxes, model_object_status.print_instances.front().trafo)) {
                 invalidate();
                 print_object_regions->clear();
                 model_object_status.print_object_regions_status = ModelObjectStatus::PrintObjectRegionsStatus::Invalid;

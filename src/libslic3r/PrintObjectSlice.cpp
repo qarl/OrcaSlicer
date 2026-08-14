@@ -921,11 +921,12 @@ void PrintObject::slice()
     this->set_done(posSlice);
 }
 
+// Rewrite each LayerRegion's slices from a per-layer, per-extruder segmentation ([layer][extruder-1]),
+// splitting the object into the pre-built painted PrintRegions. Shared by the MMU-paint path and the
+// PrintMan colour path; only the segmentation source differs.
 template<typename ThrowOnCancel>
-static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_cancel)
+static inline void apply_segmentation(PrintObject &print_object, std::vector<std::vector<ExPolygons>> segmentation, ThrowOnCancel throw_on_cancel)
 {
-    // Returns MM segmentation based on painting in MM segmentation gizmo
-    std::vector<std::vector<ExPolygons>> segmentation = multi_material_segmentation_by_painting(print_object, throw_on_cancel);
     assert(segmentation.size() == print_object.layer_count());
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, segmentation.size(), std::max(segmentation.size() / 128, size_t(1))),
@@ -1078,6 +1079,13 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
                 }
             }
         });
+}
+
+// MMU gizmo paint path: compute the segmentation from painted facets, then apply it.
+template<typename ThrowOnCancel>
+static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_cancel)
+{
+    apply_segmentation(print_object, multi_material_segmentation_by_painting(print_object, throw_on_cancel), throw_on_cancel);
 }
 
 template<typename ThrowOnCancel>
@@ -1282,6 +1290,33 @@ void PrintObject::slice_volumes()
 
         BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - MMU segmentation";
         apply_mm_segmentation(*this, [print]() { print->throw_if_canceled(); });
+    }
+
+    // PrintMan colour: an amplified scene splits into the per-extruder regions PrintApply built from
+    // scene.filaments. TEMPORARY de-risk source = a hardcoded world-Z band (whole layers alternate
+    // filament, no shader) as plane-covering segments; the real per-face shader colour replaces this
+    // segmentation, keeping the same [layer][extruder-1] shape. apply_segmentation then rewrites the
+    // per-extruder LayerRegions exactly as the painted-facet path does.
+    if (m_print->config().filament_diameter.size() > 1 && ! m_layers.empty()) {
+        const ModelVolume *colored = nullptr;
+        for (const ModelVolume *v : this->model_object()->volumes)
+            if (v->printman_scene && ! v->printman_scene->filaments.empty()) { colored = v; break; }
+        if (colored) {
+            const size_t                     num_ext = m_print->config().filament_diameter.size();
+            const std::vector<unsigned int> &fil     = colored->printman_scene->filaments;
+            const double                     zmid    = 0.5 * (m_layers.front()->slice_z + m_layers.back()->slice_z);
+            const coord_t                    B       = scaled<coord_t>(1000.0);   // covers any bed
+            ExPolygons cover(1);
+            cover.front().contour.points = { Point(-B, -B), Point(B, -B), Point(B, B), Point(-B, B) };
+            std::vector<std::vector<ExPolygons>> seg(m_layers.size(), std::vector<ExPolygons>(num_ext));
+            for (size_t L = 0; L < m_layers.size(); ++ L) {
+                const unsigned int e = (m_layers[L]->slice_z < zmid) ? fil.front() : fil.back();
+                if (e >= 1 && e <= num_ext)
+                    seg[L][e - 1] = cover;
+            }
+            BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - PrintMan colour segmentation";
+            apply_segmentation(*this, std::move(seg), [print]() { print->throw_if_canceled(); });
+        }
     }
 
     // Is any ModelVolume fuzzy skin painted?
