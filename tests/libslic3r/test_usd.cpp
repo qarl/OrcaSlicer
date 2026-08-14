@@ -159,6 +159,72 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine splits an amplified scene into 
     }
 }
 
+// Dithering (engine): a constant INTERMEDIATE colour (the linear midpoint of the two filaments) is
+// unreachable by either filament, so hard-quantize picks ONE filament for the whole surface. Dithering
+// instead spreads both filaments in a spatial pattern that area-averages to the target. Assert
+// nearest -> exactly one channel, dither -> both channels present and roughly balanced. C++ lambda, no OSL.
+SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers an intermediate colour across filaments", "[usd][subdiv][PrintMan][color][dither]")
+{
+    GIVEN("a cube shaded a constant purple over a red/blue 2-filament palette") {
+        Model       model;
+        std::string message;
+        REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, true));
+        const ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+
+        const Transform3d m = vol->get_matrix();
+        float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+        for (const Vec3f &v : vol->mesh().its.vertices) {
+            const float z = float((m * v.cast<double>()).z());
+            zmin = std::min(zmin, z);
+            zmax = std::max(zmax, z);
+        }
+        std::vector<float> zs;
+        for (float z = zmin + 0.1f; z < zmax - 1e-4f; z += 0.2f)
+            zs.push_back(z);
+        REQUIRE(zs.size() > 10);
+        MeshSlicingParamsEx params;
+        params.trafo      = m;
+        params.subdiv_tol = 0.05;
+
+        PrintMan::ColorField color;
+        color.palette     = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
+        color.band_width  = 0.5;   // match the dither cell so the pattern is distinct, not smeared
+        color.dither_cell = 0.5;
+        color.eval        = [](const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+            return PrintMan::V3{{0.5, 0.0, 0.5}};   // linear midpoint of red & blue -- unreachable by one filament
+        };
+
+        auto total = [](const std::vector<std::vector<ExPolygons>> &seg, size_t k) {
+            double a = 0.0;
+            for (const std::vector<ExPolygons> &layer : seg)
+                if (k < layer.size())
+                    for (const ExPolygon &p : layer[k])
+                        a += p.area();
+            return a;
+        };
+
+        WHEN("hard-quantized (no dither)") {
+            std::vector<std::vector<ExPolygons>> seg;
+            PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color, &seg);
+            THEN("exactly one filament wins the whole surface") {
+                REQUIRE((total(seg, 0) == 0.0) != (total(seg, 1) == 0.0));
+            }
+        }
+        WHEN("dithered") {
+            color.dither = true;
+            std::vector<std::vector<ExPolygons>> seg;
+            PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color, &seg);
+            const double a0 = total(seg, 0), a1 = total(seg, 1);
+            THEN("both filaments appear and are roughly balanced (the mix averages to the target)") {
+                REQUIRE(a0 > 0.0);
+                REQUIRE(a1 > 0.0);
+                REQUIRE(std::abs(a0 - a1) < 0.5 * (a0 + a1));   // neither dominates; ~50/50 for f=0.5
+            }
+        }
+    }
+}
+
 SCENARIO_METHOD(UsdResourcesFixture, "A displacement shader moves the sliced surface", "[usd][subdiv][PrintMan][displace]")
 {
     GIVEN("a subdivision cube sliced with and without a raised Gridwork displacement") {

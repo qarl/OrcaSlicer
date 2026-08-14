@@ -31,7 +31,9 @@ struct DisplacementField {
 struct ColorField {
     std::function<V3(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy)> eval;
     std::vector<FlushPredict::RGBColor> palette;
-    double band_width = 1.0;   // mm: width of the colour ribbon deposited along a wall (>= a few perimeters)
+    double band_width  = 1.0;    // mm: width of the colour ribbon deposited along a wall (>= a few perimeters)
+    bool   dither      = false;  // spatially dither Cout across the two nearest filaments, else hard quantize
+    double dither_cell = 0.5;    // mm: dither pattern cell (~ a line width); ignored unless `dither`
     explicit operator bool() const { return bool(eval) && ! palette.empty(); }
 };
 

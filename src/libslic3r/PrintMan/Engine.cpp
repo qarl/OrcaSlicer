@@ -307,7 +307,9 @@ static void accumulate_color_bands(const indexed_triangle_set &its, const std::v
                            (double(a.z()) + b.z() + c.z()) / 3.0}};
         const V3 e1{{double(b.x()) - a.x(), double(b.y()) - a.y(), double(b.z()) - a.z()}};
         const V3 e2{{double(c.x()) - a.x(), double(c.y()) - a.y(), double(c.z()) - a.z()}};
-        const int k = nearest_filament(color.eval(centroid, face_normal(a, b, c), e1, e2), color.palette);
+        const V3  cout = color.eval(centroid, face_normal(a, b, c), e1, e2);
+        const int k    = color.dither ? dither_filament(cout, color.palette, dither_hash(centroid, color.dither_cell))
+                                      : nearest_filament(cout, color.palette);
         if (k < 0)
             continue;
         const float        zlo  = std::min({a.z(), b.z(), c.z()}), zhi = std::max({a.z(), b.z(), c.z()});
