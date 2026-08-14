@@ -13,7 +13,8 @@ shader printman_grid(
     float Phase          = 0.75,
     int   Raised         = 1,
     int   Printable      = 1,
-    output float Disp    = 0.0)
+    output float Disp    = 0.0,
+    output color Cout    = color(0, 0, 0))   // surface colour: grid (raised rib) vs not-grid (groove/flat)
 {
     float tan_a    = ExtrusionWidth / LayerHeight;          // tan(self_supporting_angle) = ew/lh
     float asked    = DepthBeads * ExtrusionWidth;           // Device.beads(depth_beads)
@@ -38,4 +39,7 @@ shader printman_grid(
     }
     float cut = min(per_axis[0], min(per_axis[1], per_axis[2]));
     Disp = (Raised != 0) ? (depth - cut) : (0.0 - cut);
+    // Colour the raised ribs (the visible lattice) one filament and the grooves/flat surface the
+    // other -- "grid" vs "not-grid". Disp is near `depth` on a rib and near 0 in a groove.
+    Cout = (Disp > 0.5 * depth) ? color(1, 0, 0) : color(0, 0, 1);   // grid rib = red, not-grid = blue
 }

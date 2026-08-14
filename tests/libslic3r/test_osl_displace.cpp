@@ -344,4 +344,73 @@ SCENARIO("OSL shader returns a surface colour (Cout)", "[osl][color]")
     }
 }
 
+// The grid shader now also outputs a surface colour: red on the raised ribs (the visible lattice),
+// blue in the grooves/flat surface -- "grid" vs "not-grid". Sample it over a lattice and assert Cout
+// tracks Disp (a clearly-raised point is red, a clearly-cut point is blue) with no inversions and both
+// colours occurring. This is the colour source the amplification path uses to drive filament choice.
+SCENARIO("The grid shader colours grid vs not-grid by its displacement", "[osl][color][grid]")
+{
+    OslDisplaceFixture fixture;
+    GIVEN("printman_grid with its Cout output") {
+        PrintMan::OslDisplaceShader grid(PRINTMAN_OSL_TEST_DIR, "printman_grid");
+        REQUIRE(grid.has_color());
+        const PrintMan::V3 n{{0.5773, 0.5773, 0.5773}};   // generic normal: the pattern is not retired
+        THEN("a clearly-raised sample is red, a clearly-cut sample is blue, and both occur") {
+            size_t red_high = 0, blue_low = 0, violations = 0;
+            for (double x = 0.0; x <= 3.0 + 1e-9; x += 0.5)
+                for (double y = 0.0; y <= 3.0 + 1e-9; y += 0.5)
+                    for (double z = 0.0; z <= 3.0 + 1e-9; z += 0.5) {
+                        const PrintMan::V3 p{{x, y, z}};
+                        const double       d = grid(p, n);          // Disp
+                        const PrintMan::V3 c = grid.color(p, n);    // Cout
+                        const bool is_red  = c[0] > 0.5;
+                        const bool is_blue = c[2] > 0.5;
+                        if (d > 0.6) { if (is_red) ++ red_high; else ++ violations; }   // clearly a rib
+                        if (d < 0.1) { if (is_blue) ++ blue_low; else ++ violations; }  // clearly a groove
+                    }
+            INFO("red_high=" << red_high << " blue_low=" << blue_low << " violations=" << violations);
+            REQUIRE(violations == 0);
+            REQUIRE(red_high  > 0);
+            REQUIRE(blue_low  > 0);
+        }
+    }
+}
+
+// Measurement (opt-in, hidden [.gridcolor]): slice the grid-shaded cage through the engine's colour
+// path and report how the whole-layer (Phase A) vote distributes the two filaments -- so we can SEE
+// whether the grid's within-layer colour survives whole-layer voting or collapses to one filament.
+SCENARIO("Grid colour through the amplification engine -- per-layer distribution", "[.gridcolor]")
+{
+    OslDisplaceFixture fixture;
+    Model model; std::vector<float> zs; MeshSlicingParamsEx params;
+    const ModelVolume *vol = load_cage(model, "cube_grid.usda", zs, params);
+
+    PrintMan::OslDisplaceShader osl(PRINTMAN_OSL_TEST_DIR, "printman_grid");
+    REQUIRE(osl.has_color());
+
+    PrintMan::DisplacementField disp;
+    disp.max_magnitude = vol->printman_scene->osl_max_displacement;
+    disp.eval_d = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return osl(p, n, dx, dy); };
+
+    PrintMan::ColorField color;
+    color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
+    color.eval    = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return osl.color(p, n, dx, dy); };
+
+    std::vector<std::vector<ExPolygons>> seg;
+    const std::vector<ExPolygons>        layers =
+        PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, disp, color, &seg);
+    REQUIRE(seg.size() == zs.size());
+
+    auto   area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+    size_t red = 0, blue = 0, none = 0;
+    for (size_t L = 0; L < seg.size(); ++ L) {
+        const bool r = ! seg[L].empty() && area(seg[L][0]) > 0.0;
+        const bool b = seg[L].size() > 1 && area(seg[L][1]) > 0.0;
+        if (r) ++ red;
+        if (b) ++ blue;
+        if (! r && ! b) ++ none;
+    }
+    std::printf("[gridcolor] layers=%zu  red(rib)=%zu  blue(groove)=%zu  none=%zu\n", zs.size(), red, blue, none);
+}
+
 #endif // SLIC3R_OSL
