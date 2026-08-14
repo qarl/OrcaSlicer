@@ -31,6 +31,7 @@ struct DisplacementField {
 struct ColorField {
     std::function<V3(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy)> eval;
     std::vector<FlushPredict::RGBColor> palette;
+    double band_width = 1.0;   // mm: width of the colour ribbon deposited along a wall (>= a few perimeters)
     explicit operator bool() const { return bool(eval) && ! palette.empty(); }
 };
 
@@ -39,8 +40,8 @@ struct ColorField {
 // stands in at the slice_volume seam. Divergences from slicing one combined mesh: vase mode
 // keeps N largest contours, and closing_radius closes each instance before the union.
 // out_segmentation (when non-null AND a ColorField is given): filled with [layer][channel] contours,
-// channel k = color.palette[k]. Phase A assigns each layer wholly to its dominant channel; the merged
-// per-layer contours are returned as usual, unaffected by colour.
+// channel k = color.palette[k]. Each channel gets the wall ribbons of its colour clipped to the layer
+// (a within-layer pattern); the merged per-layer contours are returned as usual, unaffected by colour.
 std::vector<ExPolygons> slice_scene(
     const PrintManScene         &scene,
     const MeshSlicingParamsEx   &params,

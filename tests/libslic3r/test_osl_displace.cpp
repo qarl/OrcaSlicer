@@ -402,15 +402,17 @@ SCENARIO("Grid colour through the amplification engine -- per-layer distribution
     REQUIRE(seg.size() == zs.size());
 
     auto   area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
-    size_t red = 0, blue = 0, none = 0;
+    size_t red = 0, blue = 0, both = 0, none = 0;
     for (size_t L = 0; L < seg.size(); ++ L) {
         const bool r = ! seg[L].empty() && area(seg[L][0]) > 0.0;
         const bool b = seg[L].size() > 1 && area(seg[L][1]) > 0.0;
         if (r) ++ red;
         if (b) ++ blue;
+        if (r && b) ++ both;
         if (! r && ! b) ++ none;
     }
-    std::printf("[gridcolor] layers=%zu  red(rib)=%zu  blue(groove)=%zu  none=%zu\n", zs.size(), red, blue, none);
+    // Phase B should show `both` high (grid rib+groove within the same layer); Phase A showed both=0.
+    std::printf("[gridcolor] layers=%zu  red(rib)=%zu  blue(groove)=%zu  both=%zu  none=%zu\n", zs.size(), red, blue, both, none);
 }
 
 #endif // SLIC3R_OSL

@@ -90,11 +90,11 @@ SCENARIO("PrintMan quantizes a surface colour to the nearest filament", "[PrintM
     }
 }
 
-// Amplification colour (Phase A, engine): slice a cage with a ColorField whose Cout is red below the
-// mid-Z and blue above. The engine classifies each refined face and hands back [layer][channel]
-// contours; each layer is assigned wholly to its dominant channel. Assert the split follows the shader
-// in Z (bottom third red = channel 0, top third blue = channel 1) with exactly one channel per layer.
-// Uses a C++ colour lambda -- no OSL, always built.
+// Amplification colour (Phase B, engine): slice a cage with a ColorField whose Cout is red below the
+// mid-Z and blue above. The engine deposits a colour ribbon along each refined face's slice segment and
+// hands back [layer][channel] wall bands (clipped to the layer contour). Assert the split follows the
+// shader in Z (bottom third carries red = channel 0, top third blue = channel 1) and that each channel
+// is a band WITHIN the layer, not the whole layer. Uses a C++ colour lambda -- no OSL, always built.
 SCENARIO_METHOD(UsdResourcesFixture, "The engine splits an amplified scene into per-filament layers", "[usd][subdiv][PrintMan][color]")
 {
     GIVEN("a subdivision cube coloured red (low Z) / blue (high Z) over a 2-filament palette") {
@@ -136,21 +136,22 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine splits an amplified scene into 
 
         auto area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
 
-        THEN("each non-empty layer is one channel, and the split follows the shader in Z") {
+        THEN("layers carry a within-layer wall band, and the split follows the shader in Z") {
             const double lo3 = double(zs.front()) + (double(zs.back()) - zs.front()) / 3.0;
             const double hi3 = double(zs.back())  - (double(zs.back()) - zs.front()) / 3.0;
             size_t red_layers = 0, blue_layers = 0;
             for (size_t L = 0; L < zs.size(); ++ L) {
                 REQUIRE(seg[L].size() == 2);
-                const bool has_red  = area(seg[L][0]) > 0.0;
-                const bool has_blue = area(seg[L][1]) > 0.0;
+                const double ared = area(seg[L][0]), ablue = area(seg[L][1]);
+                const bool   has_red = ared > 0.0, has_blue = ablue > 0.0;
                 if (layers[L].empty()) { REQUIRE_FALSE(has_red); REQUIRE_FALSE(has_blue); continue; }
-                REQUIRE(has_red != has_blue);                                             // one channel/layer
-                REQUIRE(area(seg[L][has_red ? 0 : 1]) == Catch::Approx(area(layers[L]))); // the whole layer
+                REQUIRE((has_red || has_blue));                       // the layer surface is coloured
+                REQUIRE(ared  <= area(layers[L]) + 1e-6);             // each channel clipped to the layer
+                REQUIRE(ablue <= area(layers[L]) + 1e-6);
                 if (has_red)  ++ red_layers;
                 if (has_blue) ++ blue_layers;
-                if (zs[L] < lo3) REQUIRE(has_red);    // clearly-low layers  -> red  (channel 0)
-                if (zs[L] > hi3) REQUIRE(has_blue);   // clearly-high layers -> blue (channel 1)
+                if (zs[L] < lo3) { REQUIRE(has_red);  REQUIRE(ared  < area(layers[L])); }  // a band, not the whole layer
+                if (zs[L] > hi3) { REQUIRE(has_blue); REQUIRE(ablue < area(layers[L])); }
             }
             REQUIRE(red_layers  > 0);
             REQUIRE(blue_layers > 0);
