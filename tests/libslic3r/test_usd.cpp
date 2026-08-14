@@ -20,6 +20,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Exception.hpp"
 #include "libslic3r/PrintMan/Engine.hpp"
+#include "libslic3r/PrintMan/Palette.hpp"
 #include "libslic3r/TriangleMeshSlicer.hpp"
 
 using namespace Slic3r;
@@ -37,6 +38,57 @@ struct UsdResourcesFixture
 
     std::string previous;
 };
+
+// Palette match: the colour path evaluates a shader's linear-RGB Cout per refined face, then maps it
+// to the nearest loaded filament by CIELAB DeltaE2000 (reusing FlushPredict). Pure -- no USD, no OSL,
+// no fixture. The shader's Cout is LINEAR, so the encode into sRGB (what DeltaE2000 expects) is part
+// of the contract and is checked here too.
+SCENARIO("PrintMan quantizes a surface colour to the nearest filament", "[PrintMan][palette][color]")
+{
+    using FlushPredict::RGBColor;
+    GIVEN("an R/G/B/black/white filament palette (sRGB bytes)") {
+        const std::vector<RGBColor> palette = {
+            RGBColor(255,   0,   0),   // 0: red
+            RGBColor(  0, 255,   0),   // 1: green
+            RGBColor(  0,   0, 255),   // 2: blue
+            RGBColor(  0,   0,   0),   // 3: black
+            RGBColor(255, 255, 255),   // 4: white
+        };
+        THEN("a pure linear primary maps to its own filament") {
+            REQUIRE(PrintMan::nearest_filament(PrintMan::V3{{1, 0, 0}}, palette) == 0);
+            REQUIRE(PrintMan::nearest_filament(PrintMan::V3{{0, 1, 0}}, palette) == 1);
+            REQUIRE(PrintMan::nearest_filament(PrintMan::V3{{0, 0, 1}}, palette) == 2);
+            REQUIRE(PrintMan::nearest_filament(PrintMan::V3{{0, 0, 0}}, palette) == 3);
+            REQUIRE(PrintMan::nearest_filament(PrintMan::V3{{1, 1, 1}}, palette) == 4);
+        }
+        THEN("an off-primary maps to the perceptually nearest filament") {
+            // A strong but impure red is still nearest red, not black/white, under DeltaE2000.
+            REQUIRE(PrintMan::nearest_filament(PrintMan::V3{{0.6, 0.06, 0.06}}, palette) == 0);
+            // Mid grey is nearest an achromatic filament (black or white), never a chroma primary.
+            const int g = PrintMan::nearest_filament(PrintMan::V3{{0.5, 0.5, 0.5}}, palette);
+            REQUIRE((g == 3 || g == 4));
+        }
+    }
+    GIVEN("an empty palette") {
+        THEN("there is no filament to choose") {
+            REQUIRE(PrintMan::nearest_filament(PrintMan::V3{{0.2, 0.4, 0.6}}, {}) == -1);
+        }
+    }
+    GIVEN("the linear->sRGB encode") {
+        THEN("endpoints hit the byte extremes and 0.5 linear lands near sRGB 188") {
+            REQUIRE(int(PrintMan::linear_to_srgb8(0.0)) == 0);
+            REQUIRE(int(PrintMan::linear_to_srgb8(1.0)) == 255);
+            const int mid = int(PrintMan::linear_to_srgb8(0.5));
+            REQUIRE(mid >= 186);
+            REQUIRE(mid <= 190);
+        }
+        THEN("non-finite and out-of-gamut inputs clamp into range, never garbage") {
+            REQUIRE(int(PrintMan::linear_to_srgb8(std::nan(""))) == 0);   // NaN shader colour -> black, not UB
+            REQUIRE(int(PrintMan::linear_to_srgb8(-1.0))         == 0);
+            REQUIRE(int(PrintMan::linear_to_srgb8(2.0))          == 255);
+        }
+    }
+}
 
 SCENARIO_METHOD(UsdResourcesFixture, "A displacement shader moves the sliced surface", "[usd][subdiv][PrintMan][displace]")
 {
