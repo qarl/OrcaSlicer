@@ -1,0 +1,14 @@
+// A full-spectrum surface colour: the hue sweeps up the object, so the whole loaded filament palette
+// gets used -- the engine dithers each height across whichever filaments are nearest (see
+// printman:colorAllFilaments). With printman:colorObjectSpace the sweep is object-normalized in Z, so it
+// spans the object at any height. Disp = 0: colour only. Turns sets how much of the hue wheel to cover
+// bottom-to-top (0.85 stops just before wrapping magenta back to red, so the sweep stays monotonic).
+shader printman_spectrum(
+    float Turns = 0.85,
+    output color Cout = color(0, 0, 0),
+    output float Disp = 0.0)
+{
+    float t = clamp(P[2], 0.0, 1.0);
+    Cout = transformc("hsv", "rgb", color(t * Turns, 1.0, 1.0));
+    Disp = 0.0;
+}

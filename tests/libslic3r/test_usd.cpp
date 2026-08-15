@@ -247,6 +247,166 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers an intermediate colour 
     }
 }
 
+// A continuous colour gradient must span the WHOLE object bottom-to-top, dithered up the side -- the
+// feature Karl asked to see. The colour is object-normalized in Z (t = 0 at the bottom layer, 1 at the
+// top) exactly as PrintObjectSlice's colorObjectSpace wrapper does, so the gradient scales with the
+// object at any height and never saturates (the old "all cyan" bug). Cout = magenta at the base, cyan at
+// the top; dithered, so at height t a fraction ~t of the wall goes to cyan. Assert the cyan share climbs
+// monotonically from ~0 at the bottom to ~1 at the top -- the gradient spans the object. C++ lambda, no OSL.
+SCENARIO_METHOD(UsdResourcesFixture, "A dithered colour gradient spans the whole object bottom to top", "[usd][subdiv][PrintMan][color][gradient]")
+{
+    GIVEN("a subdivision cube shaded magenta(bottom)->cyan(top) over a magenta/cyan 2-filament palette") {
+        Model       model;
+        std::string message;
+        REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, true));
+        const ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+
+        const Transform3d m = vol->get_matrix();
+        float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+        for (const Vec3f &v : vol->mesh().its.vertices) {
+            const float z = float((m * v.cast<double>()).z());
+            zmin = std::min(zmin, z);
+            zmax = std::max(zmax, z);
+        }
+        std::vector<float> zs;
+        for (float z = zmin + 0.1f; z < zmax - 1e-4f; z += 0.2f)
+            zs.push_back(z);
+        REQUIRE(zs.size() > 10);
+
+        MeshSlicingParamsEx params;
+        params.trafo      = m;
+        params.subdiv_tol = 0.05;
+
+        // Object-normalized gradient: t in [0,1] across the object's Z, magenta(1,0,1)->cyan(0,1,1) linear.
+        const double z0 = zs.front(), zspan = double(zs.back()) - z0;
+        PrintMan::ColorField color;
+        color.palette     = {FlushPredict::RGBColor(255, 0, 255), FlushPredict::RGBColor(0, 255, 255)};
+        color.dither      = true;
+        color.band_width  = 0.5;   // match the dither cell so ribbons barely overlap (no lower-id bias)
+        color.dither_cell = 0.5;
+        color.eval        = [z0, zspan](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+            double t = zspan > 1e-9 ? (p[2] - z0) / zspan : 0.0;
+            t = std::clamp(t, 0.0, 1.0);
+            return PrintMan::V3{{1.0 - t, t, 1.0}};   // channel 0 = magenta, channel 1 = cyan
+        };
+
+        std::vector<std::vector<ExPolygons>> seg;
+        PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color, &seg);
+        REQUIRE(seg.size() == zs.size());
+
+        auto area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+
+        THEN("the cyan share climbs from ~0 at the bottom to ~1 at the top -- a gradient over the whole object") {
+            // Bin the layers into fifths of the object's height; per bin, cyan's share of the coloured area.
+            const int    NB = 5;
+            double       mag[NB] = {0}, cyan[NB] = {0};
+            for (size_t L = 0; L < zs.size(); ++ L) {
+                REQUIRE(seg[L].size() == 2);
+                double t = zspan > 1e-9 ? (double(zs[L]) - z0) / zspan : 0.0;
+                int    b = std::min(NB - 1, std::max(0, int(t * NB)));
+                mag[b]  += area(seg[L][0]);
+                cyan[b] += area(seg[L][1]);
+            }
+            std::vector<double> frac(NB, 0.0);
+            for (int b = 0; b < NB; ++ b) {
+                const double tot = mag[b] + cyan[b];
+                frac[b] = tot > 0.0 ? cyan[b] / tot : -1.0;
+                WARN("height bin " << b << " cyan_share=" << frac[b] << " (magenta=" << mag[b] << " cyan=" << cyan[b] << ")");
+                REQUIRE(tot > 0.0);   // every height band of the object is coloured -- the gradient spans it
+            }
+            REQUIRE(frac[0]      < 0.25);          // bottom is almost all magenta
+            REQUIRE(frac[NB - 1] > 0.75);          // top is almost all cyan
+            REQUIRE(frac[NB - 1] - frac[0] > 0.6); // and it genuinely traverses the palette up the side
+            for (int b = 1; b < NB; ++ b)
+                REQUIRE(frac[b] >= frac[b - 1] - 0.1);   // monotonic up to dither noise -- no reversal
+        }
+    }
+}
+
+// Full multi-filament dithering: a surface colour that sweeps through the WHOLE loaded palette up the
+// object must dither across ALL of it, each filament landing at the height where the colour matches it.
+// The field is a piecewise-linear sweep (in linear light) through the six palette colours in order, so at
+// height k/5 the colour IS filament k and between them the two neighbours dither. Assert every filament is
+// used and their area-weighted mean heights are strictly ordered red<...<magenta -- the colour climbs the
+// whole palette up the side. C++ lambda, no OSL, always built.
+SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers a surface colour across all loaded filaments", "[usd][subdiv][PrintMan][color][dither][allfilament]")
+{
+    GIVEN("a subdivision cube swept through a 6-filament palette (red->magenta) up its height") {
+        Model       model;
+        std::string message;
+        REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, true));
+        const ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+
+        const Transform3d m = vol->get_matrix();
+        float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+        for (const Vec3f &v : vol->mesh().its.vertices) {
+            const float z = float((m * v.cast<double>()).z());
+            zmin = std::min(zmin, z);
+            zmax = std::max(zmax, z);
+        }
+        std::vector<float> zs;
+        for (float z = zmin + 0.1f; z < zmax - 1e-4f; z += 0.2f)
+            zs.push_back(z);
+        REQUIRE(zs.size() > 10);
+
+        MeshSlicingParamsEx params;
+        params.trafo      = m;
+        params.subdiv_tol = 0.05;
+
+        const std::vector<FlushPredict::RGBColor> pal = {
+            {255, 0, 0}, {255, 255, 0}, {0, 255, 0}, {0, 255, 255}, {0, 0, 255}, {255, 0, 255}};
+        const int NP = int(pal.size());
+        std::vector<PrintMan::V3> lin;
+        for (const auto &c : pal) lin.push_back(PrintMan::linear_from_srgb(c));
+
+        const double z0 = zs.front(), zspan = double(zs.back()) - z0;
+        PrintMan::ColorField color;
+        color.palette     = pal;
+        color.dither      = true;
+        color.band_width  = 0.5;
+        color.dither_cell = 0.5;
+        color.eval        = [z0, zspan, lin, NP](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+            double t = zspan > 1e-9 ? (p[2] - z0) / zspan : 0.0;
+            t = std::clamp(t, 0.0, 1.0);
+            const double u = t * (NP - 1);
+            const int    i = std::min(NP - 2, int(u));
+            const double f = u - i;
+            return PrintMan::V3{{(1 - f) * lin[i][0] + f * lin[i + 1][0],
+                                 (1 - f) * lin[i][1] + f * lin[i + 1][1],
+                                 (1 - f) * lin[i][2] + f * lin[i + 1][2]}};
+        };
+
+        std::vector<std::vector<ExPolygons>> seg;
+        PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color, &seg);
+        REQUIRE(seg.size() == zs.size());
+
+        auto area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+
+        THEN("every filament is used, and each one's mean height climbs in palette order") {
+            std::vector<double> wsum(NP, 0.0), asum(NP, 0.0);
+            for (size_t L = 0; L < zs.size(); ++ L) {
+                REQUIRE(int(seg[L].size()) == NP);
+                const double t = zspan > 1e-9 ? (double(zs[L]) - z0) / zspan : 0.0;
+                for (int k = 0; k < NP; ++ k) {
+                    const double a = area(seg[L][k]);
+                    asum[k] += a;
+                    wsum[k] += a * t;
+                }
+            }
+            std::vector<double> meanz(NP, 0.0);
+            for (int k = 0; k < NP; ++ k) {
+                WARN("filament " << k << " total_area=" << asum[k] << " mean_height=" << (asum[k] > 0 ? wsum[k] / asum[k] : -1.0));
+                REQUIRE(asum[k] > 0.0);                 // EVERY loaded filament is used somewhere
+                meanz[k] = wsum[k] / asum[k];
+            }
+            for (int k = 1; k < NP; ++ k)
+                REQUIRE(meanz[k] > meanz[k - 1] + 0.05);   // strictly climbing -> the sweep spans the palette in order
+        }
+    }
+}
+
 SCENARIO_METHOD(UsdResourcesFixture, "A displacement shader moves the sliced surface", "[usd][subdiv][PrintMan][displace]")
 {
     GIVEN("a subdivision cube sliced with and without a raised Gridwork displacement") {
@@ -1391,3 +1551,145 @@ SCENARIO_METHOD(UsdResourcesFixture, "PrintMan colour regenerates regions when a
     REQUIRE(po->num_printing_regions() > 1);
     CHECK(nonempty[1] > 0);   // the re-slice must fill the 2nd-filament region
 }
+
+#ifdef SLIC3R_OSL
+// End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
+// cube_gradient.usda declares printman_gradient + colorObjectSpace + colorDither, so the slicer feeds the
+// shader an object-normalized Z and dithers magenta->cyan up the side. Filaments are set directly (NOT via
+// PRINTMAN_DEBUG_COLOR), so the z-band fallback is unreachable -- only the real Cout path can colour this,
+// and if the .oso fails to load the scene stays single-region and the test fails loudly. Asserts the
+// gradient spans the object (a bottom-skewed region and a distinct top-skewed one) and that the dither
+// puts BOTH filaments together across a wide middle band (a hard split could not).
+SCENARIO_METHOD(UsdResourcesFixture, "The OSL gradient shader colours the whole object through process()", "[usd][printman][color][gradient][osl]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");   // force the real Cout path; no z-band fallback
+    Model       model;
+    std::string message;
+    REQUIRE(load_usd(usd_path("cube_gradient.usda").c_str(), &model, message, nullptr, true));
+    ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    vol->printman_scene->filaments = {1, 2};                 // paint with the two loaded filaments
+    REQUIRE(vol->printman_scene->color_object_space);        // the importer read the prim hints
+    REQUIRE(vol->printman_scene->color_dither);
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>{1.75, 1.75}));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(std::vector<std::string>{"#FF00FF", "#00FFFF"}));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+
+    Print print;
+    print.apply(model, config);
+    REQUIRE(! print.objects().empty());
+    try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+
+    const PrintObject *po = print.objects().front();
+    const size_t nR = po->num_printing_regions();
+    // The real Cout shader split the object into filament regions (no fallback was available). The object's
+    // default extruder IS filament 1, so painting filament 1 is a no-op and only the cyan (filament 2) walls
+    // form an extra region: base+magenta = region 0, cyan = region 1.
+    REQUIRE(nR == 2);
+
+    const auto &layers = po->layers();
+    const size_t nL = layers.size();
+    REQUIRE(nL > 10);
+    auto region_area = [](const Layer *ly, size_t i) {
+        double a = 0.0;
+        if (i < size_t(ly->region_count()))
+            for (const Surface &s : ly->get_region(int(i))->slices.surfaces)
+                a += s.expolygon.area();
+        return a;
+    };
+    // Cyan (region 1) area per height-fifth: it should be sparse at the base and dense at the top -- the
+    // object-space gradient carried all the way through process() into the sliced per-filament regions.
+    const int NB = 5;
+    double cyan[NB] = {0}, base[NB] = {0};
+    for (size_t li = 0; li < nL; ++ li) {
+        const int b = std::min(NB - 1, int(li * NB / nL));
+        base[b] += region_area(layers[li], 0);
+        cyan[b] += region_area(layers[li], 1);
+    }
+    for (int b = 0; b < NB; ++ b) {
+        const double tot = base[b] + cyan[b];
+        WARN("height fifth " << b << " cyan_area=" << cyan[b] << " cyan_share=" << (tot > 0 ? cyan[b] / tot : 0.0));
+    }
+    const double cyan_bottom = cyan[0] + cyan[1], cyan_top = cyan[NB - 2] + cyan[NB - 1];
+    THEN("the cyan filament region is sparse at the base and dense at the top -- the gradient spans the object") {
+        REQUIRE(cyan_bottom > 0.0);              // dither puts a little cyan even low down
+        REQUIRE(cyan_top    > 0.0);
+        REQUIRE(cyan_top > 2.0 * cyan_bottom);   // but it concentrates strongly toward the top of the object
+    }
+}
+
+// End-to-end all-filament dithering through the REAL spectrum shader and the full process() pipeline.
+// cube_spectrum.usda declares printman_spectrum + colorAllFilaments + colorObjectSpace + colorDither, so
+// the slicer paints with EVERY loaded filament, dithering the hue sweep across the whole palette up the
+// object. Six distinct filaments loaded; no PRINTMAN_DEBUG_COLOR, so only the real Cout path can colour it.
+// Asserts the palette is genuinely distributed over the object's height: several filament regions receive
+// area and their area-weighted mean heights span a wide range (a low colour and a high colour).
+SCENARIO_METHOD(UsdResourcesFixture, "The spectrum shader dithers across all loaded filaments through process()", "[usd][printman][color][dither][allfilament][osl]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");
+    Model       model;
+    std::string message;
+    REQUIRE(load_usd(usd_path("cube_spectrum.usda").c_str(), &model, message, nullptr, true));
+    ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    REQUIRE(vol->printman_scene->color_all_filaments);   // the importer read the prim hint
+    REQUIRE(vol->printman_scene->filaments.empty());      // no explicit list -- resolved to all loaded
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+
+    const std::vector<std::string> hexes = {"#FF0000", "#FFFF00", "#00FF00", "#00FFFF", "#0000FF", "#FF00FF"};
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>(hexes.size(), 1.75)));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(hexes));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+
+    Print print;
+    print.apply(model, config);
+    REQUIRE(! print.objects().empty());
+    try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+
+    const PrintObject *po = print.objects().front();
+    const size_t nR = po->num_printing_regions();
+    WARN("num_printing_regions = " << nR);
+    REQUIRE(nR >= 4);   // the whole loaded palette split the object into many filament regions
+
+    const auto &layers = po->layers();
+    const size_t nL = layers.size();
+    REQUIRE(nL > 10);
+    auto region_area = [](const Layer *ly, size_t i) {
+        double a = 0.0;
+        if (i < size_t(ly->region_count()))
+            for (const Surface &s : ly->get_region(int(i))->slices.surfaces)
+                a += s.expolygon.area();
+        return a;
+    };
+    // Per region: total area and area-weighted mean height (0=bottom, 1=top). A palette spread up the side
+    // means the painted regions' mean heights range widely -- some colours low, some high.
+    std::vector<double> asum(nR, 0.0), wsum(nR, 0.0);
+    for (size_t li = 0; li < nL; ++ li) {
+        const double t = double(li) / double(nL - 1);
+        for (size_t i = 0; i < nR; ++ i) {
+            const double a = region_area(layers[li], i);
+            asum[i] += a; wsum[i] += a * t;
+        }
+    }
+    size_t used = 0;
+    double lo = 2.0, hi = -1.0;
+    for (size_t i = 0; i < nR; ++ i) {
+        const double mh = asum[i] > 0 ? wsum[i] / asum[i] : -1.0;
+        WARN("region " << i << " area=" << asum[i] << " mean_height=" << mh);
+        if (asum[i] > 0.0) ++ used;
+        if (i >= 1 && asum[i] > 0.0) { lo = std::min(lo, mh); hi = std::max(hi, mh); }   // painted regions only
+    }
+    THEN("many filaments are used and their heights span the object (palette climbs the side)") {
+        REQUIRE(used >= 4);        // at least four of the loaded filaments actually appear
+        REQUIRE(hi - lo > 0.5);    // and the painted colours are spread from low on the object to high
+    }
+}
+#endif // SLIC3R_OSL

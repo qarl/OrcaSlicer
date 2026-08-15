@@ -1,0 +1,21 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# A tall subdivision cube carrying a continuous surface-colour shader. printman:colorObjectSpace makes
+# the slicer feed the shader an object-normalized Z, so the magenta->cyan gradient spans the whole
+# object however tall it is; printman:colorDither blends the intermediate colours across the two loaded
+# filaments as a speckle up the side. Deliberately 40 mm tall (vs the 10 mm grid cube) to show the
+# gradient scales with the object rather than saturating at a fixed height.
+def Mesh "cube"
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-10, -10, 0), (10, -10, 0), (10, 10, 0), (-10, 10, 0), (-10, -10, 40), (10, -10, 40), (10, 10, 40), (-10, 10, 40)]
+    uniform token subdivisionScheme = "catmullClark"
+    custom string printman:oslShader = "printman_gradient"
+    custom bool printman:colorObjectSpace = true
+    custom bool printman:colorDither = true
+}

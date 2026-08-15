@@ -1851,12 +1851,13 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                     painting_extruders.emplace_back(state_idx);
             }
         }
-        // PrintMan colour: an amplified scene declares the filaments it paints with directly (no facets),
-        // so add them here and let the same machinery build one print region per filament.
+        // PrintMan colour: an amplified scene declares the filaments it paints with (its explicit list, or
+        // every loaded filament when color_all_filaments) directly, no facets, so add them here and let the
+        // same machinery build one print region per filament.
         if (num_extruders > 1)
             for (const ModelVolume *volume : print_object.model_object()->volumes)
                 if (volume->printman_scene)
-                    for (unsigned int e : volume->printman_scene->filaments)
+                    for (unsigned int e : PrintMan::resolved_filaments(*volume->printman_scene, num_extruders))
                         if (e >= 1 && e <= num_extruders && std::find(painting_extruders.begin(), painting_extruders.end(), e) == painting_extruders.end())
                             painting_extruders.emplace_back(e);   // clamp to loaded filaments; no out-of-range region
         if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid) {

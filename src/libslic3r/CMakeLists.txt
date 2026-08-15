@@ -708,17 +708,22 @@ if (SLIC3R_OSL)
     find_library(OSL_OIIOU_LIB OpenImageIO_Util PATHS "${OSL_BREW}/lib" REQUIRED)
     find_program(OSLC_BIN      oslc             PATHS "${OSL_ROOT}/build/bin" NO_DEFAULT_PATH REQUIRED)
 
-    # Compile the grid shader to bytecode; PrintObjectSlice loads it by name from this dir.
+    # Compile the surface shaders to bytecode; PrintObjectSlice loads them by name from this dir.
     set(PRINTMAN_OSL_SHADER_DIR "${CMAKE_BINARY_DIR}/osl_shaders")
-    add_custom_command(
-        OUTPUT "${PRINTMAN_OSL_SHADER_DIR}/printman_grid.oso"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${PRINTMAN_OSL_SHADER_DIR}"
-        COMMAND "${OSLC_BIN}" -I"${OSL_ROOT}/src/shaders"
-                -o "${PRINTMAN_OSL_SHADER_DIR}/printman_grid.oso"
-                "${CMAKE_SOURCE_DIR}/tests/data/test_osl/printman_grid.osl"
-        DEPENDS "${CMAKE_SOURCE_DIR}/tests/data/test_osl/printman_grid.osl"
-        COMMENT "Compiling the OSL grid shader (oslc)")
-    add_custom_target(printman_osl_shaders ALL DEPENDS "${PRINTMAN_OSL_SHADER_DIR}/printman_grid.oso")
+    set(_printman_osl_shaders printman_grid printman_gradient printman_spectrum)
+    set(_printman_osl_oso "")
+    foreach(_sh ${_printman_osl_shaders})
+        add_custom_command(
+            OUTPUT "${PRINTMAN_OSL_SHADER_DIR}/${_sh}.oso"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${PRINTMAN_OSL_SHADER_DIR}"
+            COMMAND "${OSLC_BIN}" -I"${OSL_ROOT}/src/shaders"
+                    -o "${PRINTMAN_OSL_SHADER_DIR}/${_sh}.oso"
+                    "${CMAKE_SOURCE_DIR}/tests/data/test_osl/${_sh}.osl"
+            DEPENDS "${CMAKE_SOURCE_DIR}/tests/data/test_osl/${_sh}.osl"
+            COMMENT "Compiling the OSL shader ${_sh} (oslc)")
+        list(APPEND _printman_osl_oso "${PRINTMAN_OSL_SHADER_DIR}/${_sh}.oso")
+    endforeach()
+    add_custom_target(printman_osl_shaders ALL DEPENDS ${_printman_osl_oso})
     add_dependencies(libslic3r printman_osl_shaders)
 
     target_include_directories(libslic3r SYSTEM PUBLIC

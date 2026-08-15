@@ -118,13 +118,16 @@ static std::vector<ExPolygons> slice_volume(
             }
 #endif
             // Colour: classify each refined face into a filament channel so the scene splits into
-            // per-filament layer contours (out_color_seg). Channels map to scene.filaments in order.
+            // per-filament layer contours (out_color_seg). Channels map to the scene's resolved filament
+            // ids in order (either its explicit list or, with color_all_filaments, every loaded filament).
             PrintMan::ColorField color;
-            if (out_color_seg && ! volume.printman_scene->filaments.empty()) {
-                const std::vector<unsigned int> &fil = volume.printman_scene->filaments;
+            const unsigned int   n_loaded = filament_colors ? (unsigned int) filament_colors->size() : 0u;
+            const std::vector<unsigned int> fil = PrintMan::resolved_filaments(*volume.printman_scene, n_loaded);
+            if (out_color_seg && ! fil.empty()) {
 #ifdef SLIC3R_OSL
                 // A real surface-colour shader (an `output color Cout` on the USD prim) drives filament
-                // choice per face, quantized to the loaded filament colours for the scene's ids.
+                // choice per face, quantized to the loaded filament colours for the scene's ids. With
+                // color_all_filaments the palette is the whole loaded set, so the colour dithers across all.
                 if (osl && osl->has_color() && filament_colors) {
                     std::vector<FlushPredict::RGBColor> palette;
                     for (unsigned int e : fil)
@@ -132,8 +135,31 @@ static std::vector<ExPolygons> slice_volume(
                             palette.push_back((*filament_colors)[e - 1]);
                     if (palette.size() == fil.size()) {
                         color.palette = std::move(palette);
-                        color.eval    = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
-                                               const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return (*osl).color(p, n, dx, dy); };
+                        // Object-normalized Z (opt-in via printman:colorObjectSpace): remap the world
+                        // point's height to [0,1] across the object's layer range so a gradient shader
+                        // spans the whole object at any size. Off -> the shader sees the world point,
+                        // which a categorical shader (the grid, grooved in world mm) needs.
+                        if (volume.printman_scene->color_object_space && zs.size() > 1) {
+                            const double z0  = zs.front();
+                            const double inv = (double(zs.back()) - z0) > 1e-9 ? 1.0 / (double(zs.back()) - z0) : 0.0;
+                            color.eval = [&osl, z0, inv](const PrintMan::V3 &p, const PrintMan::V3 &n,
+                                                         const PrintMan::V3 &dx, const PrintMan::V3 &dy) {
+                                return (*osl).color(PrintMan::V3{{p[0], p[1], (p[2] - z0) * inv}}, n, dx, dy);
+                            };
+                        } else {
+                            color.eval = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
+                                                const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return (*osl).color(p, n, dx, dy); };
+                        }
+                        // Dither a continuous colour across the two nearest filaments (opt-in via
+                        // printman:colorDither). Keep the ribbon ~ one dither cell wide: apply_segmentation
+                        // intersects each extruder's ribbons with the unmodified layer surface independently,
+                        // so an overlap between two colours' ribbons is claimed by BOTH regions -- a band
+                        // wider than the cell grows every channel and that double-claim washes out the
+                        // intended per-height mix. (The colour region is then ~one cell < one perimeter wide,
+                        // so it shows in the preview but its printed wall width is still unvalidated -- M4.)
+                        color.dither = volume.printman_scene->color_dither;
+                        if (color.dither)
+                            color.band_width = color.dither_cell;
                     }
                 }
 #endif
@@ -1350,13 +1376,13 @@ void PrintObject::slice_volumes()
         apply_mm_segmentation(*this, [print]() { print->throw_if_canceled(); });
     }
 
-    // PrintMan colour: an amplified scene splits into the per-extruder regions PrintApply built from
-    // scene.filaments. The engine classified each refined face's colour into per-channel layer contours
-    // (channel k = scene.filaments[k]); remap those to [layer][extruder-1] and apply_segmentation
-    // rewrites the per-extruder LayerRegions exactly as the painted-facet path does.
+    // PrintMan colour: an amplified scene splits into the per-extruder regions PrintApply built from its
+    // resolved filament ids. The engine classified each refined face's colour into per-channel layer
+    // contours (channel k = fil[k], the same resolved list); remap those to [layer][extruder-1] and
+    // apply_segmentation rewrites the per-extruder LayerRegions exactly as the painted-facet path does.
     if (m_print->config().filament_diameter.size() > 1 && ! m_layers.empty() && printman_colored && ! printman_color_seg.empty()) {
         const size_t                     num_ext = m_print->config().filament_diameter.size();
-        const std::vector<unsigned int> &fil     = printman_colored->printman_scene->filaments;
+        const std::vector<unsigned int>  fil     = PrintMan::resolved_filaments(*printman_colored->printman_scene, (unsigned int) num_ext);
         std::vector<std::vector<ExPolygons>> seg(m_layers.size(), std::vector<ExPolygons>(num_ext));
         for (size_t L = 0; L < m_layers.size() && L < printman_color_seg.size(); ++ L)
             for (size_t k = 0; k < fil.size() && k < printman_color_seg[L].size(); ++ k) {

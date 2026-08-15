@@ -1,0 +1,22 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# A tall subdivision cube carrying a full-spectrum surface-colour shader dithered across EVERY loaded
+# filament. printman:colorAllFilaments makes the slicer paint with the whole loaded palette (not a fixed
+# pair); printman:colorObjectSpace normalizes the hue sweep in Z so it spans the object; printman:colorDither
+# blends each height across the two nearest filaments, so the object climbs through the whole palette up its
+# side. Load several distinct filaments to see the effect.
+def Mesh "cube"
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-10, -10, 0), (10, -10, 0), (10, 10, 0), (-10, 10, 0), (-10, -10, 40), (10, -10, 40), (10, 10, 40), (-10, 10, 40)]
+    uniform token subdivisionScheme = "catmullClark"
+    custom string printman:oslShader = "printman_spectrum"
+    custom bool printman:colorObjectSpace = true
+    custom bool printman:colorDither = true
+    custom bool printman:colorAllFilaments = true
+}
