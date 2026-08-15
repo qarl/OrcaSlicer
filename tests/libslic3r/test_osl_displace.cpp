@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,8 @@
 #include "libslic3r/SVG.hpp"
 #include "libslic3r/PrintMan/Engine.hpp"
 #include "libslic3r/PrintMan/OslShader.hpp"
+#include "libslic3r/Format/USDSubdiv.hpp"
+#include <array>
 
 using namespace Slic3r;
 
@@ -394,7 +397,8 @@ SCENARIO("Grid colour through the amplification engine -- per-layer distribution
 
     PrintMan::ColorField color;
     color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
-    color.eval    = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return osl.color(p, n, dx, dy); };
+    color.eval    = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dx, const PrintMan::V3 &dy,
+                           double u, double v) { return osl.color(p, n, dx, dy, u, v); };
 
     std::vector<std::vector<ExPolygons>> seg;
     const std::vector<ExPolygons>        layers =
@@ -413,6 +417,72 @@ SCENARIO("Grid colour through the amplification engine -- per-layer distribution
     }
     // Phase B should show `both` high (grid rib+groove within the same layer); Phase A showed both=0.
     std::printf("[gridcolor] layers=%zu  red(rib)=%zu  blue(groove)=%zu  both=%zu  none=%zu\n", zs.size(), red, blue, both, none);
+}
+
+// Headless proof of the authored-UV texture pipeline end to end: load the sphere carrying face-varying
+// primvars:st, refine it (Catmull-Clark -- the UV is refined face-varyingly ALONGSIDE position, the whole
+// point of this feature), sample the bound earth shader at each refined face's UV (texture(earth.tx, u, v)),
+// and render a front view of the coloured sphere to /tmp/earth_sphere.ppm. Recognisable continents prove the
+// chain: authored st -> FVar refine -> shader u/v globals -> texture(). Hidden ([.earth]); a diagnostic image.
+SCENARIO("earth texture maps onto the sphere through authored face-varying UV", "[.earth][osl]")
+{
+    Model model; std::vector<float> zs; MeshSlicingParamsEx params;
+    const ModelVolume *vol = load_cage(model, "sphere_earth.usda", zs, params);
+    REQUIRE(vol->printman_scene->cages.size() == 1);
+    const PrintMan::SubdivCage &sc = vol->printman_scene->cages.begin()->second;
+    REQUIRE(! sc.st.empty());   // the importer read the authored face-varying UV
+
+    usd_subdiv::Cage cage = usd_subdiv::build_cage(
+        sc.points, sc.face_counts, sc.face_indices, sc.crease_indices, sc.crease_lengths, sc.crease_sharp,
+        sc.corner_indices, sc.corner_sharp, sc.boundary, sc.triangle_smooth, sc.st);
+    REQUIRE(cage.has_uv());
+    cage = usd_subdiv::subdivide(cage, "catmullClark", 5);
+    REQUIRE(cage.has_uv());     // UV survived every refinement level
+
+    // The earth shader + earth.tx are a local demo asset (not committed -- the texture is a 2.7 MB binary),
+    // so skip gracefully if they are not staged; the [uvcolor] test covers the authored-UV path without them.
+    std::optional<PrintMan::OslDisplaceShader> earth_opt;
+    try { earth_opt.emplace(PRINTMAN_OSL_TEST_DIR, "printman_earth"); }
+    catch (const std::exception &e) { WARN("skipping [.earth]: " << e.what()); return; }
+    PrintMan::OslDisplaceShader &earth = *earth_opt;
+    REQUIRE(earth.has_color());
+
+    const int W = 220, H = 220;
+    const double R = 15.5;
+    std::vector<std::array<unsigned char, 3>> img(size_t(W) * H, {{20, 20, 30}});
+    std::vector<double>                       depth(size_t(W) * H, 1e9);
+    auto s2b = [](double x) { x = x < 0 ? 0 : (x > 1 ? 1 : x); return (unsigned char)(std::pow(x, 1.0 / 2.2) * 255.0 + 0.5); };
+    int coloured = 0;
+    for (int f = 0; f < cage.nfaces(); ++ f) {
+        const int s = cage.foff[f], e = cage.foff[f + 1];
+        usd_subdiv::Pt   c{{0, 0, 0}};
+        std::array<double, 2> uv{{0, 0}};
+        for (int k = s; k < e; ++ k) {
+            const auto &p = cage.verts[cage.fvi[k]];
+            c[0] += p[0]; c[1] += p[1]; c[2] += p[2];
+            uv[0] += cage.fvar[k][0]; uv[1] += cage.fvar[k][1];
+        }
+        const double inv = 1.0 / (e - s);
+        c[0] *= inv; c[1] *= inv; c[2] *= inv; uv[0] *= inv; uv[1] *= inv;
+        if (c[1] > 0) continue;   // front hemisphere only (viewer at -Y looking +Y)
+        const PrintMan::V3 col = earth.color(PrintMan::V3{{c[0], c[1], c[2]}}, PrintMan::V3{{0, -1, 0}},
+                                             PrintMan::V3{{0, 0, 0}}, PrintMan::V3{{0, 0, 0}}, uv[0], uv[1]);
+        const int px = int((c[0] + R) / (2 * R) * W), py = int((R - c[2]) / (2 * R) * H);   // z up -> image y down
+        if (px < 0 || px >= W || py < 0 || py >= H) continue;
+        const size_t idx = size_t(py) * W + px;
+        if (c[1] < depth[idx]) {   // nearest front face wins
+            depth[idx] = c[1];
+            img[idx]   = {{s2b(col[0]), s2b(col[1]), s2b(col[2])}};
+            ++ coloured;
+        }
+    }
+    if (FILE *fp = std::fopen("/tmp/earth_sphere.ppm", "w")) {
+        std::fprintf(fp, "P3\n%d %d\n255\n", W, H);
+        for (const auto &c : img) std::fprintf(fp, "%d %d %d ", c[0], c[1], c[2]);
+        std::fclose(fp);
+        WARN("wrote /tmp/earth_sphere.ppm (coloured " << coloured << " px from " << cage.nfaces() << " faces)");
+    }
+    REQUIRE(coloured > 500);
 }
 
 #endif // SLIC3R_OSL

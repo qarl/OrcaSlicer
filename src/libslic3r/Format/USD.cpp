@@ -26,8 +26,11 @@
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/sphere.h>
 #include <pxr/usd/usdGeom/metrics.h>
+#include <pxr/usd/usdGeom/primvar.h>
+#include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdGeom/xformCache.h>
+#include <pxr/base/gf/vec2f.h>
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/materialBindingAPI.h>
 #include <pxr/usd/usdShade/shader.h>
@@ -293,6 +296,51 @@ bool is_renderable(const UsdPrim &prim, const UsdTimeCode when, SkipCounts &skip
     return true;
 }
 
+// Read primvars:st into one (u,v) per face-corner (parallel to face_indices), resolving the primvar's
+// interpolation -- faceVarying is one value per corner (what a seamed sphere authors, and what the engine
+// refines face-varyingly); vertex/varying is one per point, looked up by the corner's vertex. Any indexing
+// is honoured. Empty when the prim carries no st, or st is constant/uniform (not a per-surface texture map).
+std::vector<std::array<double, 2>> read_st_primvar(const UsdGeomMesh &mesh, UsdTimeCode when,
+                                                   const std::vector<int> &face_indices)
+{
+    std::vector<std::array<double, 2>> out;
+    const UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(mesh.GetPrim()).GetPrimvar(TfToken("st"));
+    VtVec2fArray vals;
+    if (! pv || ! pv.HasValue() || ! pv.Get(&vals, when) || vals.empty())
+        return out;
+    VtIntArray idx;
+    const bool     indexed = pv.IsIndexed() && pv.GetIndices(&idx, when) && ! idx.empty();
+    const TfToken  interp  = pv.GetInterpolation();
+    const size_t   C       = face_indices.size();
+    // The array actually indexed into per lookup: the index array if indexed, else the value array.
+    const size_t   primary = indexed ? idx.size() : vals.size();
+    auto sample = [&](long long lookup) -> std::array<double, 2> {
+        const long long j = indexed ? (lookup >= 0 && lookup < (long long) idx.size() ? idx[lookup] : -1) : lookup;
+        if (j < 0 || j >= (long long) vals.size()) return {0.0, 0.0};
+        return {double(vals[j][0]), double(vals[j][1])};
+    };
+    if (interp == UsdGeomTokens->faceVarying) {
+        if (primary < C) {   // too few st for the face-corners -> refuse rather than zero-fill a partial UV
+            BOOST_LOG_TRIVIAL(warning) << "load_usd: primvars:st (faceVarying) has " << primary
+                << " entries for " << C << " face-corners; ignoring the UV.";
+            return out;
+        }
+        out.resize(C);
+        for (size_t i = 0; i < C; ++i) out[i] = sample((long long) i);              // per face-corner
+    } else if (interp == UsdGeomTokens->vertex || interp == UsdGeomTokens->varying) {
+        int max_v = -1;
+        for (int v : face_indices) max_v = std::max(max_v, v);
+        if (primary <= size_t(std::max(max_v, 0))) {   // too few st to cover every referenced point
+            BOOST_LOG_TRIVIAL(warning) << "load_usd: primvars:st (vertex) has " << primary
+                << " entries but a face references point " << max_v << "; ignoring the UV.";
+            return out;
+        }
+        out.resize(C);
+        for (size_t i = 0; i < C; ++i) out[i] = sample((long long) face_indices[i]); // per point, via the corner's vertex
+    }
+    return out;   // constant/uniform -> left empty
+}
+
 // Read a mesh's subdivision attributes (creases, corners, interpolateBoundary, triangleSubdivisionRule)
 // into a local-frame SubdivCage carried to slice time. Winding stays the raw `left_handed` (mirror is
 // held in the placement xform, flipped per placement). When `compute_aabb`, the cage is refined once at
@@ -334,6 +382,7 @@ PrintMan::SubdivCage read_subdiv_cage(const UsdGeomMesh &mesh, UsdTimeCode when,
     sc.crease_sharp    = cs;
     sc.corner_indices  = ki;
     sc.corner_sharp    = ks;
+    sc.st              = read_st_primvar(mesh, when, indices);   // authored UV (face-varying) for texturing
     sc.boundary        = boundary;
     sc.triangle_smooth = tri_smooth;
     sc.flip_winding    = left_handed;

@@ -123,7 +123,7 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine splits an amplified scene into 
         const double zmid = 0.5 * (double(zs.front()) + zs.back());
         PrintMan::ColorField color;
         color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
-        color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+        color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, double, double) {
             return p[2] < zmid ? PrintMan::V3{{1, 0, 0}} : PrintMan::V3{{0, 0, 1}};
         };
 
@@ -191,7 +191,7 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers an intermediate colour 
         color.palette     = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
         color.band_width  = 0.5;   // match the dither cell so the pattern is distinct, not smeared
         color.dither_cell = 0.5;
-        color.eval        = [](const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+        color.eval        = [](const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, double, double) {
             return PrintMan::V3{{0.5, 0.0, 0.5}};   // linear midpoint of red & blue -- unreachable by one filament
         };
 
@@ -231,7 +231,7 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers an intermediate colour 
             color3.dither      = true;
             color3.band_width  = 0.5;
             color3.dither_cell = 0.5;
-            color3.eval        = [](const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+            color3.eval        = [](const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, double, double) {
                 return PrintMan::V3{{0.5, 0.5, 0.0}};   // red+green; blue is the odd one out
             };
             std::vector<std::vector<ExPolygons>> seg;
@@ -285,7 +285,7 @@ SCENARIO_METHOD(UsdResourcesFixture, "A dithered colour gradient spans the whole
         color.dither      = true;
         color.band_width  = 0.5;   // match the dither cell so ribbons barely overlap (no lower-id bias)
         color.dither_cell = 0.5;
-        color.eval        = [z0, zspan](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+        color.eval        = [z0, zspan](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, double, double) {
             double t = zspan > 1e-9 ? (p[2] - z0) / zspan : 0.0;
             t = std::clamp(t, 0.0, 1.0);
             return PrintMan::V3{{1.0 - t, t, 1.0}};   // channel 0 = magenta, channel 1 = cyan
@@ -367,7 +367,7 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers a surface colour across
         color.dither      = true;
         color.band_width  = 0.5;
         color.dither_cell = 0.5;
-        color.eval        = [z0, zspan, lin, NP](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+        color.eval        = [z0, zspan, lin, NP](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, double, double) {
             double t = zspan > 1e-9 ? (p[2] - z0) / zspan : 0.0;
             t = std::clamp(t, 0.0, 1.0);
             const double u = t * (NP - 1);
@@ -442,7 +442,7 @@ SCENARIO_METHOD(UsdResourcesFixture, "A dithered surface colour claims the objec
             color.dither      = true;
             color.dither_cell = 0.5;
             color.band_width  = bw;
-            color.eval        = [z0, zspan](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+            color.eval        = [z0, zspan](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &, double, double) {
                 double t = zspan > 1e-9 ? (p[2] - z0) / zspan : 0.0; t = std::clamp(t, 0.0, 1.0);
                 return PrintMan::V3{{1.0 - t, t, 1.0}};
             };
@@ -1687,6 +1687,61 @@ SCENARIO_METHOD(UsdResourcesFixture, "The OSL gradient shader colours the whole 
         REQUIRE(cyan_bottom > 0.0);              // dither puts a little cyan even low down
         REQUIRE(cyan_top    > 0.0);
         REQUIRE(cyan_top > 2.0 * cyan_bottom);   // but it concentrates strongly toward the top of the object
+    }
+}
+
+// End-to-end AUTHORED-UV texture path through the full process() pipeline (the whole reason face-varying st
+// exists). cube_uv.usda authors face-varying primvars:st with v = 0 at the base .. 1 at the top, bound to
+// printman_uv whose Cout = color(u, v, 0) -- it reads ONLY the u/v globals, never P, so a colour that varies
+// up the wall can ONLY come from the authored st refined through subdivision and delivered to the shader.
+// Slots: 1 = red (base, matches low v), 2 = green (matches high v). Proves refine_region's UV carry +
+// triangulate_cage's tri_uv + accumulate_color_bands feed authored UV all the way to the shader.
+SCENARIO_METHOD(UsdResourcesFixture, "Authored face-varying UV drives the surface colour through process()", "[usd][printman][color][uvtexture][osl]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");   // force the real Cout path; no z-band fallback
+    Model       model;
+    std::string message;
+    REQUIRE(load_usd(usd_path("cube_uv.usda").c_str(), &model, message, nullptr, true));
+    ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    REQUIRE(vol->printman_scene->cages.size() == 1);
+    REQUIRE(! vol->printman_scene->cages.begin()->second.st.empty());   // the importer read the authored UV
+    vol->printman_scene->filaments = {1, 2};
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>{1.75, 1.75}));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(std::vector<std::string>{"#FF0000", "#00FF00"}));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+
+    Print print;
+    print.apply(model, config);
+    REQUIRE(! print.objects().empty());
+    try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+
+    const PrintObject *po = print.objects().front();
+    REQUIRE(po->num_printing_regions() == 2);   // base(red) + green
+    const auto &layers = po->layers();
+    const size_t nL = layers.size();
+    REQUIRE(nL > 10);
+    auto region_area = [](const Layer *ly, size_t i) {
+        double a = 0.0;
+        if (i < size_t(ly->region_count()))
+            for (const Surface &s : ly->get_region(int(i))->slices.surfaces) a += s.expolygon.area();
+        return a;
+    };
+    // Green (region 1) area per height-fifth: authored v puts green at the TOP, and printman_uv ignores P,
+    // so green concentrating high proves the authored UV reached the shader.
+    const int NB = 5;
+    double green[NB] = {0};
+    for (size_t li = 0; li < nL; ++ li)
+        green[std::min(NB - 1, int(li * NB / nL))] += region_area(layers[li], 1);
+    const double green_bottom = green[0] + green[1], green_top = green[NB - 2] + green[NB - 1];
+    THEN("the green (authored high-v) filament concentrates toward the top, driven by the authored UV") {
+        REQUIRE(green_top > 0.0);
+        REQUIRE(green_top > 2.0 * green_bottom);
     }
 }
 

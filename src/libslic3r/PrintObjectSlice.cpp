@@ -158,12 +158,14 @@ static std::vector<ExPolygons> slice_volume(
                             const double z0  = zs.front();
                             const double inv = (double(zs.back()) - z0) > 1e-9 ? 1.0 / (double(zs.back()) - z0) : 0.0;
                             color.eval = [color_osl, z0, inv](const PrintMan::V3 &p, const PrintMan::V3 &n,
-                                                              const PrintMan::V3 &dx, const PrintMan::V3 &dy) {
-                                return color_osl->color(PrintMan::V3{{p[0], p[1], (p[2] - z0) * inv}}, n, dx, dy);
+                                                              const PrintMan::V3 &dx, const PrintMan::V3 &dy,
+                                                              double u, double v) {
+                                return color_osl->color(PrintMan::V3{{p[0], p[1], (p[2] - z0) * inv}}, n, dx, dy, u, v);
                             };
                         } else {
                             color.eval = [color_osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
-                                                     const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return color_osl->color(p, n, dx, dy); };
+                                                     const PrintMan::V3 &dx, const PrintMan::V3 &dy,
+                                                     double u, double v) { return color_osl->color(p, n, dx, dy, u, v); };
                         }
                         // Dither a continuous colour across the two nearest filaments (opt-in via the surface
                         // shader's inputs:dither). Leave band_width at its default: the ribbon must be at least
@@ -183,7 +185,8 @@ static std::vector<ExPolygons> slice_volume(
                 if (! color && std::getenv("PRINTMAN_DEBUG_COLOR") && fil.size() >= 2) {
                     const double zmid = 0.5 * (double(zs.front()) + zs.back());
                     color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
-                    color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+                    color.eval    = [zmid](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &,
+                                           const PrintMan::V3 &, double, double) {
                         return p[2] < zmid ? PrintMan::V3{{1, 0, 0}} : PrintMan::V3{{0, 0, 1}};
                     };
                 }

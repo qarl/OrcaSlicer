@@ -39,13 +39,17 @@ static constexpr size_t kMaxLayersPerBand = 256;
 static constexpr size_t kBucketCap = 64;
 
 // Fan-triangulate a refined n-gon cage, optional winding flip for a leftHanded prim (the world/mirror
-// flip is left to the caller, as for a plain prototype).
-static indexed_triangle_set triangulate_cage(const usd_subdiv::Cage &c, bool flip)
+// flip is left to the caller, as for a plain prototype). When the cage carries face-varying UV and tri_uv
+// is given, it is filled with one (u,v) per emitted triangle -- the mean of that triangle's face-corner UVs
+// (the winding flip does not change the mean), parallel to its.indices, for per-face colour sampling.
+static indexed_triangle_set triangulate_cage(const usd_subdiv::Cage &c, bool flip,
+                                             std::vector<std::array<float, 2>> *tri_uv = nullptr)
 {
     indexed_triangle_set its;
     its.vertices.reserve(c.verts.size());
     for (const usd_subdiv::Pt &p : c.verts)
         its.vertices.emplace_back(float(p[0]), float(p[1]), float(p[2]));
+    const bool uv = c.has_uv() && tri_uv;
     for (int f = 0; f < c.nfaces(); ++ f) {
         const int off = c.foff[f];
         const int n   = c.foff[f + 1] - off;
@@ -53,6 +57,10 @@ static indexed_triangle_set triangulate_cage(const usd_subdiv::Cage &c, bool fli
             int a = c.fvi[off], b = c.fvi[off + k], d = c.fvi[off + k + 1];
             if (flip) std::swap(b, d);
             its.indices.emplace_back(a, b, d);
+            if (uv) {
+                const auto &u0 = c.fvar[off], &u1 = c.fvar[off + k], &u2 = c.fvar[off + k + 1];
+                tri_uv->push_back({float((u0[0] + u1[0] + u2[0]) / 3.0), float((u0[1] + u1[1] + u2[1]) / 3.0)});
+            }
         }
     }
     return its;
@@ -110,7 +118,7 @@ static std::vector<std::optional<CageProto>> build_cage_protos(const PrintManSce
         cp.cage = usd_subdiv::build_cage(
             sc.points, sc.face_counts, sc.face_indices,
             sc.crease_indices, sc.crease_lengths, sc.crease_sharp,
-            sc.corner_indices, sc.corner_sharp, sc.boundary, sc.triangle_smooth);
+            sc.corner_indices, sc.corner_sharp, sc.boundary, sc.triangle_smooth, sc.st);
         cp.vf = usd_subdiv::vertex_faces(cp.cage);
         cp.ring_vids.resize(cp.cage.nfaces());
         for (int f = 0; f < cp.cage.nfaces(); ++ f) {
@@ -297,17 +305,22 @@ static size_t cage_band_count(const CageProto &cp, const MeshSlicingParamsEx &pa
 // within a single layer, not just voted whole (that was Phase A).
 static void accumulate_color_bands(const indexed_triangle_set &its, const std::vector<float> &zs,
                                    size_t first, size_t last, const ColorField &color,
+                                   const std::vector<std::array<float, 2>> &tri_uv,
                                    std::vector<std::vector<Polygons>> &bands)
 {
-    const double half = 0.5 * color.band_width;
-    for (const auto &t : its.indices) {
+    const double half     = 0.5 * color.band_width;
+    const bool   have_uv  = tri_uv.size() == its.indices.size();   // authored UV, one (u,v) per triangle
+    for (size_t ti = 0; ti < its.indices.size(); ++ ti) {
+        const auto  &t = its.indices[ti];
         const Vec3f &a = its.vertices[t[0]], &b = its.vertices[t[1]], &c = its.vertices[t[2]];
         const V3 centroid{{(double(a.x()) + b.x() + c.x()) / 3.0,
                            (double(a.y()) + b.y() + c.y()) / 3.0,
                            (double(a.z()) + b.z() + c.z()) / 3.0}};
         const V3 e1{{double(b.x()) - a.x(), double(b.y()) - a.y(), double(b.z()) - a.z()}};
         const V3 e2{{double(c.x()) - a.x(), double(c.y()) - a.y(), double(c.z()) - a.z()}};
-        const V3  cout = color.eval(centroid, face_normal(a, b, c), e1, e2);
+        const double su = have_uv ? tri_uv[ti][0] : 0.0;
+        const double sv = have_uv ? tri_uv[ti][1] : 0.0;
+        const V3  cout = color.eval(centroid, face_normal(a, b, c), e1, e2, su, sv);
         const int k    = color.dither ? dither_filament(cout, color.palette, dither_hash(centroid, color.dither_cell))
                                       : nearest_filament(cout, color.palette);
         if (k < 0)
@@ -418,7 +431,9 @@ static void slice_cage_placement(const CageProto &cp,
                 core.push_back(f);
         if (! core.empty()) {
             usd_subdiv::Cage     region = usd_subdiv::refine_region(cage, cp.vf, core, level);
-            indexed_triangle_set its    = triangulate_cage(region, cp.flip_winding);
+            std::vector<std::array<float, 2>> tri_uv;   // per-triangle authored UV (empty if the cage has none)
+            indexed_triangle_set its    = triangulate_cage(region, cp.flip_winding,
+                                                           (color && bands_local) ? &tri_uv : nullptr);
             for (Vec3f &v : its.vertices)
                 v = (m * v.cast<double>()).cast<float>();
             if (flip_det)
@@ -444,6 +459,11 @@ static void slice_cage_placement(const CageProto &cp,
                            "from the slice. Raise DisplacementField::max_magnitude to bound the shader.";
                 assert(moved <= max_disp + 1e-6);
             }
+            // Colour is sampled on the displaced, full-region triangles BEFORE the band drop, so tri_uv stays
+            // parallel to its.indices; an out-of-band triangle crosses none of this band's layers, so it
+            // deposits nothing -- identical result to sampling after the drop, minus the desync.
+            if (color && bands_local)
+                accumulate_color_bands(its, zs, first, last, color, tri_uv, *bands_local);
             drop_triangles_outside_band(its, zlo, zhi);
             assert(displacement || band_is_closed_over(its, zlo, zhi));  // closedness is a non-displaced guarantee
 
@@ -454,8 +474,6 @@ static void slice_cage_placement(const CageProto &cp,
             const std::vector<float> band_zs(zs.begin() + first, zs.begin() + last);
             std::vector<ExPolygons>  sub = slice_mesh_ex(its, band_zs, p, throw_on_cancel);
             accumulate_sections(out_local, first, sub);
-            if (color && bands_local)
-                accumulate_color_bands(its, zs, first, last, color, *bands_local);
             throw_on_cancel();
         }
         if (on_band) on_band();   // one band done -- advance the status bar (see slice_scene)

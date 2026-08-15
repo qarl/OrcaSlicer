@@ -1,0 +1,11 @@
+// Minimal authored-UV probe (no texture): the surface colour is the authored texture coordinate itself,
+// red = u, green = v. It reads ONLY the u/v globals -- never P -- so any spatial colour variation on the
+// print can only come from the mesh's authored primvars:st flowing through subdivision to the shader. Used
+// by the [uvcolor] full-pipeline test to prove the authored-UV path end to end. Disp = 0: colour only.
+shader printman_uv(
+    output color Cout = color(0, 0, 0),
+    output float Disp = 0.0)
+{
+    Cout = color(u, v, 0.0);
+    Disp = 0.0;
+}

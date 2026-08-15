@@ -710,7 +710,7 @@ if (SLIC3R_OSL)
 
     # Compile the surface shaders to bytecode; PrintObjectSlice loads them by name from this dir.
     set(PRINTMAN_OSL_SHADER_DIR "${CMAKE_BINARY_DIR}/osl_shaders")
-    set(_printman_osl_shaders printman_grid printman_gradient printman_spectrum)
+    set(_printman_osl_shaders printman_grid printman_gradient printman_spectrum printman_uv)
     set(_printman_osl_oso "")
     foreach(_sh ${_printman_osl_shaders})
         add_custom_command(

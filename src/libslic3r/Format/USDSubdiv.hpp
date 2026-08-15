@@ -37,10 +37,16 @@ struct Cage {
     std::vector<int> fvi, foff;               // faces in CSR form
     std::map<long long, double> edge_crease;  // undirected-edge key -> sharpness
     std::vector<double> corner_sharp;         // per vertex, 0 where untagged
+    // Optional face-varying UV (primvars:st), one (u,v) per face-corner -- parallel to fvi, so a seam
+    // vertex carries a distinct UV on each side (what vertex interpolation cannot do). Refined bilinearly
+    // (per face, no cross-face averaging), matching USD's faceVaryingLinearInterpolation = "all". Empty =
+    // the cage carries no UV. Only Catmull-Clark refinement (catmull_clark/refine_region) propagates it.
+    std::vector<std::array<double, 2>> fvar;
     int boundary = BOUNDARY_EDGE_AND_CORNER;
     bool triangle_smooth = false;             // triangleSubdivisionRule == "smooth"
     int nfaces() const { return int(foff.size()) - 1; }
     int nverts() const { return int(verts.size()); }
+    bool has_uv() const { return fvar.size() == fvi.size() && ! fvi.empty(); }
 };
 
 inline long long ekey(int a, int b, long long nv) {
@@ -231,6 +237,26 @@ inline Cage catmull_clark(const Cage &c) {
     out.foff.resize(C + 1);
     for (int i = 0; i <= C; ++i) out.foff[i] = 4 * i;
     propagate(out, nv, nf, t, crease, c.corner_sharp);
+    // Face-varying UV, refined bilinearly per face (no cross-face averaging, so seams stay split). Each new
+    // quad {corner, next-edge, face, prev-edge} matches the fvi push order above, so the pushes stay in sync.
+    if (c.has_uv()) {
+        out.fvar.reserve(size_t(4) * C);
+        for (int f = 0; f < nf; ++f) {
+            const int s = c.foff[f], e = c.foff[f + 1];
+            std::array<double, 2> favg{0, 0};
+            for (int k = s; k < e; ++k) { favg[0] += c.fvar[k][0]; favg[1] += c.fvar[k][1]; }
+            const double inv = 1.0 / double(e - s);
+            favg[0] *= inv; favg[1] *= inv;
+            for (int k = s; k < e; ++k) {
+                const int kn = (k + 1 < e) ? k + 1 : s;   // next corner in this face
+                const int kp = (k > s) ? k - 1 : e - 1;   // prev corner in this face
+                out.fvar.push_back(c.fvar[k]);
+                out.fvar.push_back({(c.fvar[k][0] + c.fvar[kn][0]) * 0.5, (c.fvar[k][1] + c.fvar[kn][1]) * 0.5});
+                out.fvar.push_back(favg);
+                out.fvar.push_back({(c.fvar[k][0] + c.fvar[kp][0]) * 0.5, (c.fvar[k][1] + c.fvar[kp][1]) * 0.5});
+            }
+        }
+    }
     return out;
 }
 
@@ -336,7 +362,8 @@ inline Cage build_cage(const std::vector<Pt> &points, const std::vector<int> &co
                        const std::vector<int> &indices, const std::vector<int> &creaseIndices,
                        const std::vector<int> &creaseLengths, const std::vector<double> &creaseSharpnesses,
                        const std::vector<int> &cornerIndices, const std::vector<double> &cornerSharpnesses,
-                       int boundary, bool triangle_smooth) {
+                       int boundary, bool triangle_smooth,
+                       const std::vector<std::array<double, 2>> &fvar_uv = {}) {
     Cage c;
     c.boundary = boundary;
     c.triangle_smooth = triangle_smooth;
@@ -346,6 +373,8 @@ inline Cage build_cage(const std::vector<Pt> &points, const std::vector<int> &co
     for (int n : counts) c.foff.push_back(c.foff.back() + n);
     c.fvi = indices;
     c.corner_sharp.assign(points.size(), 0.0);
+    // Face-varying UV is one (u,v) per face-corner; ignore a mismatched array rather than desync it.
+    if (fvar_uv.size() == indices.size()) c.fvar = fvar_uv;
 
     long long per_edge_total = 0;
     for (int l : creaseLengths) per_edge_total += std::max(l - 1, 0);
@@ -501,9 +530,13 @@ inline Cage refine_region(const Cage &c, const std::vector<std::vector<int>> &vf
         sub.verts.push_back(c.verts[v]);
         return id;
     };
+    const bool uv = c.has_uv();
     sub.foff.push_back(0);
     for (int g : faces) {
-        for (int k = c.foff[g]; k < c.foff[g + 1]; ++k) sub.fvi.push_back(vid(c.fvi[k]));
+        for (int k = c.foff[g]; k < c.foff[g + 1]; ++k) {
+            sub.fvi.push_back(vid(c.fvi[k]));
+            if (uv) sub.fvar.push_back(c.fvar[k]);   // face-varying UV rides with the sub-cage's corners
+        }
         sub.foff.push_back(int(sub.fvi.size()));
     }
     // Carry the creases and corners that fall inside the sub-cage.
@@ -537,9 +570,13 @@ inline Cage refine_region(const Cage &c, const std::vector<std::vector<int>> &vf
         out.verts.push_back(r.verts[v]);
         return id;
     };
+    const bool ruv = r.has_uv();
     out.foff.push_back(0);
     for (long long g = 0; g < hi; ++g) {
-        for (int k = r.foff[g]; k < r.foff[g + 1]; ++k) out.fvi.push_back(vid2(r.fvi[k]));
+        for (int k = r.foff[g]; k < r.foff[g + 1]; ++k) {
+            out.fvi.push_back(vid2(r.fvi[k]));
+            if (ruv) out.fvar.push_back(r.fvar[k]);   // carry the refined face-varying UV to the output
+        }
         out.foff.push_back(int(out.fvi.size()));
     }
     return out;

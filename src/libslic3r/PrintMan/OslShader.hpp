@@ -19,6 +19,7 @@
 // execute(). A future full port can swap the mutex+map for tbb::enumerable_thread_specific.
 
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,7 @@
 #include <OSL/rendererservices.h>
 #include <OSL/shaderglobals.h>
 #include <OpenImageIO/errorhandler.h>
+#include <OpenImageIO/texture.h>
 #include <OpenImageIO/ustring.h>
 
 #include "libslic3r/PrintMan/Displace.hpp"   // V3, DisplaceShader
@@ -36,10 +38,11 @@
 namespace Slic3r { namespace PrintMan {
 
 class OslDisplaceShader {
-    // A shader that only reads P/N needs no renderer services, so every base default suffices.
-    // Stateless, so it is safe to share one instance across threads.
+    // Given OIIO's TextureSystem so texture() (image lookups, e.g. an authored map) resolves; every other
+    // service stays defaulted (a shader that only reads P/N/uv still works). The texture system is thread-safe,
+    // so one Renderer is safely shared across the slicer's threads.
     struct Renderer final : public OSL::RendererServices {
-        Renderer() : OSL::RendererServices(nullptr) {}
+        explicit Renderer(OIIO::TextureSystem *ts) : OSL::RendererServices(ts) {}
         int supports(OSL::string_view) const override { return 0; }
     };
 
@@ -53,9 +56,15 @@ public:
                       const std::string &shadername,
                       const std::string &disp_output  = "Disp",
                       const std::string &color_output = "Cout")
-        : m_output(disp_output), m_color_output(color_output), m_layer("layer1")
+        : m_ts(OIIO::TextureSystem::create(/*shared=*/false)), m_rend(m_ts.get()),
+          m_output(disp_output), m_color_output(color_output), m_layer("layer1")
     {
-        m_ss = new OSL::ShadingSystem(&m_rend, nullptr, &m_err);
+        // A PRIVATE texture system (shared=false), not the process-global one: its searchpath is set per
+        // instance below, so two shaders loaded from different dirs cannot clobber each other's texture path.
+        // OIIO 3.x create() returns a shared_ptr whose deleter tears the system down -- held in m_ts.
+        // texture() image lookups resolve against the same dir as the shaders (where the .tx maps live).
+        m_ts->attribute("searchpath", searchpath);
+        m_ss = new OSL::ShadingSystem(&m_rend, m_ts.get(), &m_err);
         OSL::ustring sp(searchpath);
         m_ss->attribute("searchpath:shader", OIIO::TypeDesc::STRING, &sp);
 
@@ -151,12 +160,18 @@ public:
     // do not share an eval, so read each output with its own call.
     V3 color(const V3 &point, const V3 &normal) const
     {
-        return color(point, normal, V3{{0, 0, 0}}, V3{{0, 0, 0}});
+        return color(point, normal, V3{{0, 0, 0}}, V3{{0, 0, 0}}, 0.0, 0.0);
     }
     V3 color(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy) const
     {
+        return color(point, normal, dPdx, dPdy, 0.0, 0.0);
+    }
+    // As above, plus the authored surface texture coordinate as OSL's u/v globals, so a colour shader can
+    // texture(name, u, v) an image map. {0,0,0} if the shader has no colour output.
+    V3 color(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy, double u, double v) const
+    {
         if (!m_color_sym) return V3{{0, 0, 0}};
-        OSL::ShadingContext *ctx = run(point, normal, dPdx, dPdy);
+        OSL::ShadingContext *ctx = run(point, normal, dPdx, dPdy, u, v);
         const void *adr = m_ss->symbol_address(*ctx, m_color_sym);
         if (!adr) return V3{{0, 0, 0}};
         const float *rgb = reinterpret_cast<const float *>(adr);
@@ -166,7 +181,8 @@ public:
 private:
     // Run the shader once for (point, normal, footprint) on this thread's ShadingContext; the caller
     // then reads whichever resolved output symbol it wants off that context via symbol_address.
-    OSL::ShadingContext *run(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy) const
+    OSL::ShadingContext *run(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy,
+                             double u = 0.0, double v = 0.0) const
     {
         OSL::ShadingContext *ctx = context_for_this_thread();
         OSL::ShaderGlobals sg;
@@ -176,6 +192,8 @@ private:
         sg.dPdy     = OSL::Vec3(float(dPdy[0]),  float(dPdy[1]),  float(dPdy[2]));
         sg.N        = OSL::Vec3(float(normal[0]), float(normal[1]), float(normal[2]));
         sg.Ng       = sg.N;
+        sg.u        = float(u);   // authored surface texture coordinate (OSL global u)
+        sg.v        = float(v);   // authored surface texture coordinate (OSL global v)
         sg.renderer = const_cast<Renderer *>(&m_rend);
         m_ss->execute(*ctx, *m_group, sg);
         return ctx;
@@ -195,6 +213,7 @@ private:
         return it->second.ctx;
     }
 
+    std::shared_ptr<OIIO::TextureSystem> m_ts;   // owns the texture system; its raw ptr is handed to OSL
     Renderer                 m_rend;
     OIIO::ErrorHandler       m_err;
     OSL::ShadingSystem      *m_ss  = nullptr;

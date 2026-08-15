@@ -1,0 +1,46 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# A tall creased box carrying authored FACE-VARYING primvars:st, bound to printman_uv (Cout = the UV itself:
+# red=u, green=v). u is a constant 0.5; v runs 0 at the base to 1 at the top. Since printman_uv reads only the
+# u/v globals (never P), any colour that varies up the wall proves the authored st was refined through
+# subdivision and delivered to the shader. Creased so the cage stays a box (flat top/bottom, full-height wall).
+def Mesh "cube" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-10, -10, 0), (10, -10, 0), (10, 10, 0), (-10, 10, 0), (-10, -10, 40), (10, -10, 40), (10, 10, 40), (-10, 10, 40)]
+    texCoord2f[] primvars:st = [
+        (0.5, 0), (0.5, 0), (0.5, 0), (0.5, 0),
+        (0.5, 1), (0.5, 1), (0.5, 1), (0.5, 1),
+        (0.5, 0), (0.5, 0), (0.5, 1), (0.5, 1),
+        (0.5, 0), (0.5, 0), (0.5, 1), (0.5, 1),
+        (0.5, 0), (0.5, 0), (0.5, 1), (0.5, 1),
+        (0.5, 0), (0.5, 0), (0.5, 1), (0.5, 1)
+    ] (
+        interpolation = "faceVarying"
+    )
+    uniform token subdivisionScheme = "catmullClark"
+    int[] creaseIndices = [0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7]
+    int[] creaseLengths = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    float[] creaseSharpnesses = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    int[] cornerIndices = [0, 1, 2, 3, 4, 5, 6, 7]
+    float[] cornerSharpnesses = [10, 10, 10, 10, 10, 10, 10, 10]
+    rel material:binding = </cube/Material>
+
+    def Material "Material"
+    {
+        token outputs:surface.connect = </cube/Material/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_uv"
+            token outputs:out
+        }
+    }
+}

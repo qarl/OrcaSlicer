@@ -24,12 +24,13 @@ struct DisplacementField {
     explicit operator bool() const { return bool(eval) || bool(eval_d); }
 };
 
-// Optional surface-colour shader for the amplification engine: eval(point, normal, dPdx, dPdy) is the
+// Optional surface-colour shader for the amplification engine: eval(point, normal, dPdx, dPdy, u, v) is the
 // linear-RGB colour of a refined surface point, quantized to `palette` (the loaded filament colours as
-// sRGB bytes; channel k = palette[k]). When set and slice_scene is given an out_segmentation, the scene
-// is classified per refined face and split into per-channel layer contours. Empty = single colour.
+// sRGB bytes; channel k = palette[k]). (u, v) is the face's authored texture coordinate (0 when the cage
+// carries no UV). When set and slice_scene is given an out_segmentation, the scene is classified per refined
+// face and split into per-channel layer contours. Empty = single colour.
 struct ColorField {
-    std::function<V3(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy)> eval;
+    std::function<V3(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy, double u, double v)> eval;
     std::vector<FlushPredict::RGBColor> palette;
     double band_width  = 1.0;    // mm: width of the colour ribbon deposited along a wall (>= a few perimeters)
     bool   dither      = false;  // spatially dither Cout across the two nearest filaments, else hard quantize

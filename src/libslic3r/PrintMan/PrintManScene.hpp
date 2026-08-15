@@ -32,6 +32,7 @@ struct SubdivCage
     std::vector<double>                crease_sharp;
     std::vector<int>                   corner_indices;  // USD cornerIndices / Sharpnesses
     std::vector<double>                corner_sharp;
+    std::vector<std::array<double, 2>> st;              // primvars:st, one (u,v) per face-corner; empty = none
     int                                boundary        = 2;      // usd_subdiv::Boundary
     bool                               triangle_smooth = false;  // triangleSubdivisionRule == "smooth"
     bool                               flip_winding    = false;  // orientation == leftHanded

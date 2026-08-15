@@ -1,0 +1,13 @@
+// Surface-colour demo: sample an equirectangular Earth image (earth.tx) at the authored surface UV. The
+// slicer refines the mesh's face-varying primvars:st through subdivision and feeds it as OSL's u/v globals,
+// so this is a plain texture lookup -- "a texture mapped onto the print". v is flipped because our authored
+// v runs 0 (south) -> 1 (north) while texture()'s t runs 0 at the top scanline (north) downward. Cout is
+// linear RGB (the earth.tx was converted sRGB->linear when built), matching the PrintMan colour convention.
+// Disp = 0: colour only, no displacement.
+shader printman_earth(
+    output color Cout = color(0, 0, 0),
+    output float Disp = 0.0)
+{
+    Cout = (color) texture("earth.tx", u, 1.0 - v);
+    Disp = 0.0;
+}
