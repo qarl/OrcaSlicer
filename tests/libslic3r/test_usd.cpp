@@ -407,6 +407,72 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers a surface colour across
     }
 }
 
+// What Karl SEES on the printed side is the outer wall's colour, not the interior (that stays the base
+// filament). The colour is deposited as a band_width-wide ribbon along each face's slice segment; if the
+// ribbon is thinner than a perimeter it fails to claim the outer wall and the object reads as one filament
+// even though the segmentation has every channel. Measure the fraction of a one-perimeter-wide outer ring
+// that the coloured ribbons actually cover, swept over band_width. Proves a too-thin ribbon (my
+// band_width = dither_cell regression) under-covers, and a >= 1-perimeter ribbon colours the wall.
+SCENARIO_METHOD(UsdResourcesFixture, "A dithered surface colour claims the object's outer wall", "[usd][subdiv][PrintMan][color][coverage]")
+{
+    GIVEN("a gradient-shaded cube sliced with colour ribbons of different widths") {
+        Model       model;
+        std::string message;
+        REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, true));
+        const ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+
+        const Transform3d m = vol->get_matrix();
+        float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+        for (const Vec3f &v : vol->mesh().its.vertices) {
+            const float z = float((m * v.cast<double>()).z());
+            zmin = std::min(zmin, z); zmax = std::max(zmax, z);
+        }
+        std::vector<float> zs;
+        for (float z = zmin + 0.1f; z < zmax - 1e-4f; z += 0.2f) zs.push_back(z);
+        REQUIRE(zs.size() > 10);
+        MeshSlicingParamsEx params; params.trafo = m; params.subdiv_tol = 0.05;
+        const double z0 = zs.front(), zspan = double(zs.back()) - z0;
+
+        auto area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+        // Fraction of a ~one-perimeter outer ring covered by the union of coloured ribbons, at ribbon width bw.
+        auto outer_wall_coverage = [&](double bw) {
+            PrintMan::ColorField color;
+            color.palette     = {FlushPredict::RGBColor(255, 0, 255), FlushPredict::RGBColor(0, 255, 255)};
+            color.dither      = true;
+            color.dither_cell = 0.5;
+            color.band_width  = bw;
+            color.eval        = [z0, zspan](const PrintMan::V3 &p, const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &) {
+                double t = zspan > 1e-9 ? (p[2] - z0) / zspan : 0.0; t = std::clamp(t, 0.0, 1.0);
+                return PrintMan::V3{{1.0 - t, t, 1.0}};
+            };
+            std::vector<std::vector<ExPolygons>> seg;
+            const std::vector<ExPolygons> layers = PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color, &seg);
+            double ring_area = 0.0, colored_ring = 0.0;
+            for (size_t L = 0; L < layers.size(); ++ L) {
+                if (layers[L].empty()) continue;
+                const ExPolygons inner = offset_ex(layers[L], - float(scale_(0.45)));   // erode by ~one perimeter
+                const ExPolygons ring  = diff_ex(layers[L], inner);
+                ExPolygons all;
+                for (const ExPolygons &ch : seg[L]) all.insert(all.end(), ch.begin(), ch.end());
+                const ExPolygons colored = union_ex(all);
+                ring_area    += area(ring);
+                colored_ring += area(intersection_ex(colored, ring));
+            }
+            return ring_area > 0.0 ? colored_ring / ring_area : 0.0;
+        };
+
+        const double c05 = outer_wall_coverage(0.5);   // the band_width = dither_cell regression
+        const double c10 = outer_wall_coverage(1.0);   // the ColorField default (what the grid demo used)
+        const double c15 = outer_wall_coverage(1.5);
+        WARN("outer-wall colour coverage: band=0.5 -> " << c05 << ", band=1.0 -> " << c10 << ", band=1.5 -> " << c15);
+        THEN("a ribbon at least a perimeter wide colours most of the outer wall; the too-thin one does not") {
+            REQUIRE(c10 > 0.85);           // the default 1.0 mm ribbon covers the visible side
+            REQUIRE(c10 > c05 + 0.2);      // materially better than the thin ribbon that reads as one filament
+        }
+    }
+}
+
 SCENARIO_METHOD(UsdResourcesFixture, "A displacement shader moves the sliced surface", "[usd][subdiv][PrintMan][displace]")
 {
     GIVEN("a subdivision cube sliced with and without a raised Gridwork displacement") {

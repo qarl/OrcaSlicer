@@ -151,15 +151,15 @@ static std::vector<ExPolygons> slice_volume(
                                                 const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return (*osl).color(p, n, dx, dy); };
                         }
                         // Dither a continuous colour across the two nearest filaments (opt-in via
-                        // printman:colorDither). Keep the ribbon ~ one dither cell wide: apply_segmentation
-                        // intersects each extruder's ribbons with the unmodified layer surface independently,
-                        // so an overlap between two colours' ribbons is claimed by BOTH regions -- a band
-                        // wider than the cell grows every channel and that double-claim washes out the
-                        // intended per-height mix. (The colour region is then ~one cell < one perimeter wide,
-                        // so it shows in the preview but its printed wall width is still unvalidated -- M4.)
+                        // printman:colorDither). Leave band_width at its default: the ribbon must be at least
+                        // one perimeter wide or it fails to claim the object's OUTER WALL, and the printed side
+                        // then reads as the base filament even though every channel is present (measured: a
+                        // 0.5 mm ribbon covers ~57% of the outer wall, 1.0 mm ~99% -- see the [coverage] test).
+                        // The dither's spatial granularity is dither_cell, independent of the ribbon width, so
+                        // a full-width ribbon still dithers. (The 1.0 mm default suits a ~0.4-0.5 mm perimeter;
+                        // a coarse nozzle wants band_width scaled to its line width -- a follow-up, since the
+                        // perimeter width is not resolved at this seam.)
                         color.dither = volume.printman_scene->color_dither;
-                        if (color.dither)
-                            color.band_width = color.dither_cell;
                     }
                 }
 #endif
