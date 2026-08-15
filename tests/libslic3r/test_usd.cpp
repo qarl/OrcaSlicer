@@ -1758,4 +1758,69 @@ SCENARIO_METHOD(UsdResourcesFixture, "The spectrum shader dithers across all loa
         REQUIRE(hi - lo > 0.5);    // and the painted colours are spread from low on the object to high
     }
 }
+
+// THE faithful "what Karl sees" test: after the full process() pipeline, measure how much of the object's
+// OUTER WALL (a one-perimeter ring of each layer's sliced surface -- not the infill-dominated whole region,
+// not the pre-apply_segmentation ribbons) is left as the BASE filament vs claimed by the colour shader.
+// Trick that makes it clean and discriminating: load the base filament (slot 1) as WHITE, a colour the
+// hue-sweep shader never reaches -- so the base region is precisely the wall the colour FAILED to claim.
+// A too-thin ribbon (the band_width bug) leaves the base white showing over much of the wall; the fix
+// leaves almost none. The base region is the object default (extruder 1) and is the pure complement of the
+// coloured regions (apply_segmentation diffs only the base), so its ring share is the true uncovered fraction.
+SCENARIO_METHOD(UsdResourcesFixture, "The surface colour claims the printed outer wall through process()", "[usd][printman][color][wallcolor][osl]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");
+    Model       model;
+    std::string message;
+    REQUIRE(load_usd(usd_path("cube_spectrum.usda").c_str(), &model, message, nullptr, true));
+    ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+
+    // Slot 1 (the base/default extruder) = WHITE, which the red->magenta sweep never picks; slots 2-4 are the
+    // colours the sweep actually maps to. So region 0 (base=white) = the wall the shader did not colour.
+    const std::vector<std::string> hexes = {"#FFFFFF", "#00FFFF", "#FF00FF", "#FFFF00"};
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>(hexes.size(), 1.75)));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(hexes));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+
+    Print print;
+    print.apply(model, config);
+    REQUIRE(! print.objects().empty());
+    try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+
+    const PrintObject *po = print.objects().front();
+    const size_t nR = po->num_printing_regions();
+    REQUIRE(nR >= 2);
+    auto area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+    std::vector<double> wall(nR, 0.0);
+    double ring_tot = 0.0;
+    for (const Layer *ly : po->layers()) {
+        if (ly->lslices.empty()) continue;
+        const ExPolygons inner = offset_ex(ly->lslices, - float(scale_(0.45)));
+        if (inner.empty()) continue;   // skip caps/thin layers where the one-perimeter ring is ill-defined
+        const ExPolygons ring = diff_ex(ly->lslices, inner);
+        ring_tot += area(ring);
+        for (size_t i = 0; i < nR && i < size_t(ly->region_count()); ++ i) {
+            ExPolygons rs;
+            for (const Surface &s : ly->get_region(int(i))->slices.surfaces) rs.push_back(s.expolygon);
+            wall[i] += area(intersection_ex(rs, ring));   // measured against the TRUE ring, not a double-counted sum
+        }
+    }
+    REQUIRE(ring_tot > 0.0);
+    const double base_share = wall[0] / ring_tot;   // region 0 = base (white) = the uncovered wall fraction
+    int coloured_present = 0;
+    for (size_t i = 0; i < nR; ++ i) {
+        const double sh = wall[i] / ring_tot;
+        WARN("region " << i << " outer_wall_share=" << sh);
+        if (i >= 1 && sh > 0.1) ++ coloured_present;
+    }
+    THEN("the colour claims almost all of the outer wall, spread across several filaments (not left as base)") {
+        REQUIRE(base_share < 0.15);       // the shader colours >= ~85% of the visible wall (the band_width fix)
+        REQUIRE(coloured_present >= 2);    // and the palette genuinely shows -- more than one colour on the wall
+    }
+}
 #endif // SLIC3R_OSL
