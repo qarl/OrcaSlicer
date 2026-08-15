@@ -1,14 +1,16 @@
-// A full-spectrum surface colour: the hue sweeps up the object, so the whole loaded filament palette
-// gets used -- the engine dithers each height across whichever filaments are nearest (see
-// printman:colorAllFilaments). With printman:colorObjectSpace the sweep is object-normalized in Z, so it
-// spans the object at any height. Disp = 0: colour only. Turns sets how much of the hue wheel to cover
-// bottom-to-top (0.85 stops just before wrapping magenta back to red, so the sweep stays monotonic).
+// Surface-colour demo: a smooth sweep up the object through the loaded filament colours
+// (cyan -> magenta -> yellow -> white), so every filament gets a broad zone and the engine dithers the
+// blends between adjacent ones (a speckled transition, not a hard line). Tuned to a c/m/y/w filament load.
+// printman:colorObjectSpace normalizes Z so the sweep spans the object at any height. Disp = 0: colour only.
 shader printman_spectrum(
-    float Turns = 0.85,
     output color Cout = color(0, 0, 0),
     output float Disp = 0.0)
 {
     float t = clamp(P[2], 0.0, 1.0);
-    Cout = transformc("hsv", "rgb", color(t * Turns, 1.0, 1.0));
+    color C = color(0, 1, 1), M = color(1, 0, 1), Y = color(1, 1, 0), W = color(1, 1, 1);
+    float s = t * 3.0;                       // three segments across the height
+    if      (s < 1.0) Cout = mix(C, M, s);
+    else if (s < 2.0) Cout = mix(M, Y, s - 1.0);
+    else              Cout = mix(Y, W, s - 2.0);
     Disp = 0.0;
 }

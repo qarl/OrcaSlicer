@@ -1762,9 +1762,11 @@ SCENARIO_METHOD(UsdResourcesFixture, "The spectrum shader dithers across all loa
 // THE faithful "what Karl sees" test: after the full process() pipeline, measure how much of the object's
 // OUTER WALL (a one-perimeter ring of each layer's sliced surface -- not the infill-dominated whole region,
 // not the pre-apply_segmentation ribbons) is left as the BASE filament vs claimed by the colour shader.
-// Trick that makes it clean and discriminating: load the base filament (slot 1) as WHITE, a colour the
-// hue-sweep shader never reaches -- so the base region is precisely the wall the colour FAILED to claim.
-// A too-thin ribbon (the band_width bug) leaves the base white showing over much of the wall; the fix
+// Trick that makes it clean and discriminating: load the base filament (slot 1) as a neutral GREY the
+// c->m->y->w sweep never emits -- so the base region is precisely the wall the colour FAILED to claim. (Grey,
+// not white: the sweep ends at white at the top, so a white base would count the shader's own top-of-object
+// white as uncovered and the metric could not tell the two apart.)
+// A too-thin ribbon (the band_width bug) leaves the base grey showing over much of the wall; the fix
 // leaves almost none. The base region is the object default (extruder 1) and is the pure complement of the
 // coloured regions (apply_segmentation diffs only the base), so its ring share is the true uncovered fraction.
 SCENARIO_METHOD(UsdResourcesFixture, "The surface colour claims the printed outer wall through process()", "[usd][printman][color][wallcolor][osl]")
@@ -1778,9 +1780,11 @@ SCENARIO_METHOD(UsdResourcesFixture, "The surface colour claims the printed oute
     model.add_default_instances();
     model.center_instances_around_point(Vec2d(125.0, 125.0));
 
-    // Slot 1 (the base/default extruder) = WHITE, which the red->magenta sweep never picks; slots 2-4 are the
-    // colours the sweep actually maps to. So region 0 (base=white) = the wall the shader did not colour.
-    const std::vector<std::string> hexes = {"#FFFFFF", "#00FFFF", "#FF00FF", "#FFFF00"};
+    // Slot 1 (the base/default extruder) = a neutral GREY the c->m->y->w sweep never emits; slots 2-5 are the
+    // palette the sweep maps to (cyan, magenta, yellow, white). So region 0 (base=grey) is exactly the wall the
+    // shader failed to colour. Grey, not white: the sweep ends at white, so a white base would count the shader's
+    // own top-of-object white as "uncovered" and the metric could not tell the two apart.
+    const std::vector<std::string> hexes = {"#808080", "#00FFFF", "#FF00FF", "#FFFF00", "#FFFFFF"};
     DynamicPrintConfig config;
     config.apply(FullPrintConfig::defaults());
     config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>(hexes.size(), 1.75)));
@@ -1811,16 +1815,81 @@ SCENARIO_METHOD(UsdResourcesFixture, "The surface colour claims the printed oute
         }
     }
     REQUIRE(ring_tot > 0.0);
-    const double base_share = wall[0] / ring_tot;   // region 0 = base (white) = the uncovered wall fraction
+    const double base_share = wall[0] / ring_tot;   // region 0 = base (grey) = the uncovered wall fraction
     int coloured_present = 0;
     for (size_t i = 0; i < nR; ++ i) {
         const double sh = wall[i] / ring_tot;
         WARN("region " << i << " outer_wall_share=" << sh);
-        if (i >= 1 && sh > 0.1) ++ coloured_present;
+        if (i >= 1 && sh > 0.05) ++ coloured_present;   // filament i genuinely shows on the wall (>5%)
     }
-    THEN("the colour claims almost all of the outer wall, spread across several filaments (not left as base)") {
+    THEN("the colour claims almost all of the outer wall, spread across every filament (not left as base)") {
         REQUIRE(base_share < 0.15);       // the shader colours >= ~85% of the visible wall (the band_width fix)
-        REQUIRE(coloured_present >= 2);    // and the palette genuinely shows -- more than one colour on the wall
+        REQUIRE(coloured_present >= 4);    // and every filament in the c->m->y->w sweep genuinely shows on the wall
     }
+}
+
+// Headless RENDER of what the printed side looks like: run the exact GUI path (cube_spectrum's real .oso
+// through process(), a grey base plus the c/m/y/w palette loaded -- 5 filaments), then for each layer
+// bottom->top blend the outer-wall colour by each filament region's share of the ring, and dump it as a
+// vertical colour strip to /tmp/colorviz.ppm. Looking at that image is the "test without the GUI" -- a clean
+// bottom-to-top gradient means the engine is producing it; a flat bar would mean it is not. Also reports whether a wipe/prime
+// tower is generated (the "cube in the corner"). Not an assertion -- a diagnostic dump I inspect.
+SCENARIO_METHOD(UsdResourcesFixture, "Render the amplified surface colour to an image", "[usd][printman][color][colorviz][osl]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");
+    Model       model;
+    std::string message;
+    REQUIRE(load_usd(usd_path("cube_spectrum.usda").c_str(), &model, message, nullptr, true));
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+
+    // Slot 1 = grey base (a colour the c->m->y->w sweep never emits) so uncovered wall renders as grey and is
+    // distinct from the gradient; slots 2-5 are the palette the sweep maps to. region i -> col[i].
+    const std::vector<std::array<int,3>> col = {{128,128,128},{0,255,255},{255,0,255},{255,255,0},{255,255,255}};
+    const std::vector<std::string> hexes = {"#808080", "#00FFFF", "#FF00FF", "#FFFF00", "#FFFFFF"};
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>(hexes.size(), 1.75)));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(hexes));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+
+    Print print;
+    print.apply(model, config);
+    try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+
+    // "Cube in the corner": is a wipe/prime tower being generated?
+    WARN("enable_prime_tower=" << print.config().enable_prime_tower.value
+         << " has_wipe_tower_data=" << (print.wipe_tower_data(int(print.config().filament_diameter.size())).depth > 0.f));
+
+    const PrintObject *po = print.objects().front();
+    const size_t nR = po->num_printing_regions();
+    auto area = [](const ExPolygons &e) { double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+    // Per layer bottom->top: area-weighted blend of the outer-wall colour.
+    std::vector<std::array<int,3>> rows;
+    for (const Layer *ly : po->layers()) {
+        if (ly->lslices.empty()) { rows.push_back({40,40,40}); continue; }
+        const ExPolygons inner = offset_ex(ly->lslices, - float(scale_(0.45)));
+        const ExPolygons ring  = inner.empty() ? ly->lslices : diff_ex(ly->lslices, inner);
+        double rt = 0.0, rr = 0.0, gg = 0.0, bb = 0.0;
+        for (size_t i = 0; i < nR && i < size_t(ly->region_count()) && i < col.size(); ++ i) {
+            ExPolygons rs; for (const Surface &s : ly->get_region(int(i))->slices.surfaces) rs.push_back(s.expolygon);
+            const double a = area(intersection_ex(rs, ring));
+            rt += a; rr += a * col[i][0]; gg += a * col[i][1]; bb += a * col[i][2];
+        }
+        if (rt > 0) rows.push_back({int(rr/rt), int(gg/rt), int(bb/rt)}); else rows.push_back({30,30,30});
+    }
+    // Write a PPM strip (bottom of the object at the image bottom), 120 px wide.
+    if (FILE *f = std::fopen("/tmp/colorviz.ppm", "w")) {
+        const int W = 120, H = int(rows.size());
+        std::fprintf(f, "P3\n%d %d\n255\n", W, H);
+        for (int y = 0; y < H; ++ y) {
+            const auto &c = rows[H - 1 - y];   // top of image = top of object
+            for (int x = 0; x < W; ++ x) std::fprintf(f, "%d %d %d ", c[0], c[1], c[2]);
+            std::fprintf(f, "\n");
+        }
+        std::fclose(f);
+        WARN("wrote /tmp/colorviz.ppm (" << rows.size() << " layers)");
+    }
+    REQUIRE(! rows.empty());
 }
 #endif // SLIC3R_OSL
