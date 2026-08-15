@@ -48,10 +48,13 @@ struct PrintManScene
     std::vector<Placement>            placements;
     std::map<int, SubdivCage>         cages;   // prototype index -> cage; absent = a plain mesh
 
-    // Optional displacement shader, read from the USD prim (printman:oslShader / printman:maxDisplacement).
-    // The name is a compiled .oso on the OSL shader searchpath; the bound grows the slice band so the
-    // relief is not clipped. Only honoured when the build links OSL (SLIC3R_OSL); empty = no displacement.
-    std::string osl_shader;
+    // OSL shaders resolved from the prim's bound UsdShade material -- one per material terminal, exactly as
+    // USD models shading: `surface` drives the per-face colour (Cout), `displacement` drives the relief (Disp).
+    // Each name is a compiled .oso on the OSL shader searchpath (the shader's info:id). One shader may back
+    // both terminals (the UsdPreviewSurface pattern); either may be empty. max_displacement grows the slice
+    // band so the relief is not clipped. Only honoured when the build links OSL (SLIC3R_OSL).
+    std::string osl_surface_shader;         // material:surface      -> Cout (colour)
+    std::string osl_displacement_shader;    // material:displacement -> Disp (relief)
     double      osl_max_displacement = 0.0;
 
     // Colour: the 1-based filament ids this scene paints with. Empty = single-filament (no colour).
@@ -59,8 +62,8 @@ struct PrintManScene
     // region per filament, reusing Orca's MMU region machinery (see apply_printman_mm_segmentation).
     std::vector<unsigned int> filaments;
 
-    // Colour-shader hints, read from the prim (printman:colorObjectSpace / :colorDither). object_space
-    // feeds the colour shader an object-normalized Z (0 at the bottom layer, 1 at the top) so a gradient
+    // Colour-shader hints, read as inputs on the surface shader (inputs:objectSpace / inputs:dither).
+    // object_space feeds the colour shader an object-normalized Z (0 at the bottom layer, 1 at the top) so a gradient
     // spans the whole object at any height; dither spatially blends a continuous colour across the two
     // nearest filaments (else the colour is hard-quantized to the single nearest). Both default off, so a
     // categorical shader (the grid) keeps world coords and crisp filament regions.

@@ -28,6 +28,9 @@
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdGeom/xformCache.h>
+#include <pxr/usd/usdShade/material.h>
+#include <pxr/usd/usdShade/materialBindingAPI.h>
+#include <pxr/usd/usdShade/shader.h>
 
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Utils.hpp"
@@ -222,10 +225,11 @@ struct NamedMesh
     // `xform` its world placement. Absent -> `its` is finished world-space geometry (eager path).
     std::optional<PrintMan::SubdivCage> cage;
     Transform3d                         xform = Transform3d::Identity();
-    // Optional OSL displacement shader authored on the prim (printman:oslShader / :maxDisplacement).
-    std::string                         osl_shader;
+    // OSL shaders resolved from the prim's bound UsdShade material -- one per terminal (see PrintManScene).
+    std::string                         osl_surface_shader;        // material:surface      -> Cout
+    std::string                         osl_displacement_shader;   // material:displacement -> Disp
     double                              osl_max_displacement = 0.0;
-    // Colour-shader hints (printman:colorObjectSpace / :colorDither / :colorAllFilaments); see PrintManScene.
+    // Colour-shader hints, read as inputs on the surface shader; see PrintManScene.
     bool                                color_object_space  = false;
     bool                                color_dither        = false;
     bool                                color_all_filaments = false;
@@ -343,6 +347,48 @@ PrintMan::SubdivCage read_subdiv_cage(const UsdGeomMesh &mesh, UsdTimeCode when,
         usd_subdiv::refined_limit_aabb(cage, scheme, level, sc.refined_lo, sc.refined_hi);
     }
     return sc;
+}
+
+// The OSL shaders bound to a prim, resolved through its UsdShade material exactly as USD models shading:
+// the material's `surface` and `displacement` terminal outputs each connect to a Shader prim whose info:id
+// names a compiled OSL shader (.oso on the searchpath). One shader may back both terminals. Colour behaviour
+// (objectSpace / dither / allFilaments) and the displacement clamp (maxMagnitude) are PrintMan slicer
+// directives, not OSL parameters, so they are authored under the printman: input namespace (inputs:printman:*)
+// to keep them from colliding with a real shader parameter of the same name. All fields are empty/zero when
+// the prim carries no material binding.
+struct PrintManMaterial {
+    std::string surface;
+    std::string displacement;
+    double      max_displacement = 0.0;
+    bool        object_space  = false;
+    bool        dither        = false;
+    bool        all_filaments = false;
+};
+
+PrintManMaterial read_printman_material(const UsdPrim &prim, UsdTimeCode when)
+{
+    PrintManMaterial pm;
+    const UsdShadeMaterial mat = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
+    if (! mat)
+        return pm;
+    // surface terminal -> colour shader + its colour hints
+    if (const UsdShadeShader s = mat.ComputeSurfaceSource()) {
+        TfToken id;
+        if (s.GetShaderId(&id))
+            pm.surface = id.GetString();
+        if (const UsdShadeInput in = s.GetInput(TfToken("printman:objectSpace")))  in.Get(&pm.object_space,  when);
+        if (const UsdShadeInput in = s.GetInput(TfToken("printman:dither")))       in.Get(&pm.dither,        when);
+        if (const UsdShadeInput in = s.GetInput(TfToken("printman:allFilaments"))) in.Get(&pm.all_filaments, when);
+    }
+    // displacement terminal -> relief shader + its clamp
+    if (const UsdShadeShader s = mat.ComputeDisplacementSource()) {
+        TfToken id;
+        if (s.GetShaderId(&id))
+            pm.displacement = id.GetString();
+        float m = 0.0f;
+        if (const UsdShadeInput in = s.GetInput(TfToken("printman:maxMagnitude"))) { in.Get(&m, when); pm.max_displacement = m; }
+    }
+    return pm;
 }
 
 // amplify defers a subdivision cage to slice time (emits the control mesh + a SubdivCage); without it
@@ -625,24 +671,17 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
                 continue;
             }
 
-            // Optional displacement shader authored on the prim: a compiled .oso name plus the declared
-            // bound. Carried to the scene and applied at slice time when the build links OSL (ignored
-            // otherwise). Only meaningful for a deferred cage (the amplify path).
-            std::string osl_shader;
-            float       osl_max       = 0.0f;
-            bool        color_objsp   = false;
-            bool        color_dither  = false;
-            bool        color_all_fil = false;
-            if (deferred_cage) {
-                mesh.GetPrim().GetAttribute(TfToken("printman:oslShader")).Get(&osl_shader, when);
-                mesh.GetPrim().GetAttribute(TfToken("printman:maxDisplacement")).Get(&osl_max, when);
-                mesh.GetPrim().GetAttribute(TfToken("printman:colorObjectSpace")).Get(&color_objsp, when);
-                mesh.GetPrim().GetAttribute(TfToken("printman:colorDither")).Get(&color_dither, when);
-                mesh.GetPrim().GetAttribute(TfToken("printman:colorAllFilaments")).Get(&color_all_fil, when);
-            }
+            // OSL shaders bound to the prim through its UsdShade material (surface -> Cout, displacement ->
+            // Disp), with colour hints and the displacement clamp read as inputs on those shaders. Carried to
+            // the scene and applied at slice time when the build links OSL (ignored otherwise). Only meaningful
+            // for a deferred cage (the amplify path).
+            PrintManMaterial pm;
+            if (deferred_cage)
+                pm = read_printman_material(mesh.GetPrim(), when);
 
             out.push_back({prim.GetPath().GetString(), std::move(its), std::move(deferred_cage),
-                           cage_xform, osl_shader, double(osl_max), color_objsp, color_dither, color_all_fil});
+                           cage_xform, pm.surface, pm.displacement, pm.max_displacement,
+                           pm.object_space, pm.dither, pm.all_filaments});
             ++ mesh_count;
 
             // Counted only once the mesh is actually emitted. Counting it at the
@@ -1130,8 +1169,9 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
             place.xform     = m.xform;
             scene.placements.push_back(place);
             scene.cages.emplace(0, std::move(*m.cage));
-            scene.osl_shader           = m.osl_shader;           // displacement shader from the prim
-            scene.osl_max_displacement = m.osl_max_displacement;
+            scene.osl_surface_shader      = m.osl_surface_shader;       // material terminals from the prim
+            scene.osl_displacement_shader = m.osl_displacement_shader;
+            scene.osl_max_displacement    = m.osl_max_displacement;
             scene.color_object_space   = m.color_object_space;   // colour-shader hints from the prim
             scene.color_dither         = m.color_dither;
             scene.color_all_filaments  = m.color_all_filaments;

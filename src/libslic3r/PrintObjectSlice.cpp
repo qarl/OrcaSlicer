@@ -101,21 +101,36 @@ static std::vector<ExPolygons> slice_volume(
             params2.trafo = params.trafo * volume.get_matrix();
             PrintMan::DisplacementField disp;
 #ifdef SLIC3R_OSL
-            // A displacement shader authored on the USD prim (scene.osl_shader) is evaluated per
-            // refined surface point at slice time. A load failure degrades to no displacement, loudly.
-            std::optional<PrintMan::OslDisplaceShader> osl;
-            if (! volume.printman_scene->osl_shader.empty()) {
-                try {
-                    osl.emplace(PRINTMAN_OSL_SHADER_DIR, volume.printman_scene->osl_shader);
-                    disp.eval_d        = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
-                                                const PrintMan::V3 &dPdx, const PrintMan::V3 &dPdy) { return (*osl)(p, n, dPdx, dPdy); };
+            // The prim's UsdShade material binds up to two OSL shaders, one per terminal. The displacement
+            // shader (material:displacement) is evaluated per refined surface point for the relief; the surface
+            // shader (material:surface) drives the per-face colour below. A single shader may back both
+            // terminals (loaded once). A load failure degrades to no displacement / no colour, loudly.
+            const std::string &disp_name = volume.printman_scene->osl_displacement_shader;
+            const std::string &surf_name = volume.printman_scene->osl_surface_shader;
+            std::optional<PrintMan::OslDisplaceShader> disp_osl, surf_osl;
+            auto load_osl = [](const std::string &name, std::optional<PrintMan::OslDisplaceShader> &slot,
+                               const char *role) {
+                try { slot.emplace(PRINTMAN_OSL_SHADER_DIR, name); }
+                catch (const std::exception &e) {
+                    BOOST_LOG_TRIVIAL(error) << "PrintMan: could not load OSL " << role << " shader '"
+                        << name << "': " << e.what() << "; slicing without it.";
+                }
+            };
+            if (! disp_name.empty()) {
+                load_osl(disp_name, disp_osl, "displacement");
+                if (disp_osl) {
+                    disp.eval_d        = [&disp_osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
+                                                     const PrintMan::V3 &dPdx, const PrintMan::V3 &dPdy) { return (*disp_osl)(p, n, dPdx, dPdy); };
                     disp.max_magnitude = volume.printman_scene->osl_max_displacement;
-                } catch (const std::exception &e) {
-                    BOOST_LOG_TRIVIAL(error) << "PrintMan: could not load OSL shader '"
-                        << volume.printman_scene->osl_shader << "': " << e.what()
-                        << "; slicing without displacement.";
                 }
             }
+            // The colour shader is the dedicated surface one, or the displacement one when a single shader
+            // backs both terminals (surf_name == disp_name).
+            if (! surf_name.empty() && surf_name != disp_name)
+                load_osl(surf_name, surf_osl, "surface");
+            const PrintMan::OslDisplaceShader *color_osl =
+                surf_osl ? &*surf_osl
+                         : (! surf_name.empty() && surf_name == disp_name && disp_osl ? &*disp_osl : nullptr);
 #endif
             // Colour: classify each refined face into a filament channel so the scene splits into
             // per-filament layer contours (out_color_seg). Channels map to the scene's resolved filament
@@ -125,33 +140,33 @@ static std::vector<ExPolygons> slice_volume(
             const std::vector<unsigned int> fil = PrintMan::resolved_filaments(*volume.printman_scene, n_loaded);
             if (out_color_seg && ! fil.empty()) {
 #ifdef SLIC3R_OSL
-                // A real surface-colour shader (an `output color Cout` on the USD prim) drives filament
-                // choice per face, quantized to the loaded filament colours for the scene's ids. With
+                // A real surface-colour shader (an `output color Cout` bound to material:surface) drives
+                // filament choice per face, quantized to the loaded filament colours for the scene's ids. With
                 // color_all_filaments the palette is the whole loaded set, so the colour dithers across all.
-                if (osl && osl->has_color() && filament_colors) {
+                if (color_osl && color_osl->has_color() && filament_colors) {
                     std::vector<FlushPredict::RGBColor> palette;
                     for (unsigned int e : fil)
                         if (e >= 1 && e <= filament_colors->size())
                             palette.push_back((*filament_colors)[e - 1]);
                     if (palette.size() == fil.size()) {
                         color.palette = std::move(palette);
-                        // Object-normalized Z (opt-in via printman:colorObjectSpace): remap the world
-                        // point's height to [0,1] across the object's layer range so a gradient shader
+                        // Object-normalized Z (opt-in via the surface shader's inputs:objectSpace): remap the
+                        // world point's height to [0,1] across the object's layer range so a gradient shader
                         // spans the whole object at any size. Off -> the shader sees the world point,
                         // which a categorical shader (the grid, grooved in world mm) needs.
                         if (volume.printman_scene->color_object_space && zs.size() > 1) {
                             const double z0  = zs.front();
                             const double inv = (double(zs.back()) - z0) > 1e-9 ? 1.0 / (double(zs.back()) - z0) : 0.0;
-                            color.eval = [&osl, z0, inv](const PrintMan::V3 &p, const PrintMan::V3 &n,
-                                                         const PrintMan::V3 &dx, const PrintMan::V3 &dy) {
-                                return (*osl).color(PrintMan::V3{{p[0], p[1], (p[2] - z0) * inv}}, n, dx, dy);
+                            color.eval = [color_osl, z0, inv](const PrintMan::V3 &p, const PrintMan::V3 &n,
+                                                              const PrintMan::V3 &dx, const PrintMan::V3 &dy) {
+                                return color_osl->color(PrintMan::V3{{p[0], p[1], (p[2] - z0) * inv}}, n, dx, dy);
                             };
                         } else {
-                            color.eval = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
-                                                const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return (*osl).color(p, n, dx, dy); };
+                            color.eval = [color_osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
+                                                     const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return color_osl->color(p, n, dx, dy); };
                         }
-                        // Dither a continuous colour across the two nearest filaments (opt-in via
-                        // printman:colorDither). Leave band_width at its default: the ribbon must be at least
+                        // Dither a continuous colour across the two nearest filaments (opt-in via the surface
+                        // shader's inputs:dither). Leave band_width at its default: the ribbon must be at least
                         // one perimeter wide or it fails to claim the object's OUTER WALL, and the printed side
                         // then reads as the base filament even though every channel is present (measured: a
                         // 0.5 mm ribbon covers ~57% of the outer wall, 1.0 mm ~99% -- see the [coverage] test).

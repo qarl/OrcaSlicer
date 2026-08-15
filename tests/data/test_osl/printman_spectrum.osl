@@ -1,7 +1,7 @@
 // Surface-colour demo: a smooth sweep up the object through the loaded filament colours
 // (cyan -> magenta -> yellow -> white), so every filament gets a broad zone and the engine dithers the
 // blends between adjacent ones (a speckled transition, not a hard line). Tuned to a c/m/y/w filament load.
-// printman:colorObjectSpace normalizes Z so the sweep spans the object at any height. Disp = 0: colour only.
+// The surface shader's inputs:objectSpace normalizes Z so the sweep spans the object. Disp = 0: colour only.
 shader printman_spectrum(
     output color Cout = color(0, 0, 0),
     output float Disp = 0.0)

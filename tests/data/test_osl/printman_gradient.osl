@@ -1,7 +1,7 @@
 // Continuous surface-colour gradient up the object. Unlike the categorical grid shader, Cout varies
 // smoothly with height, so the engine dithers it across the two nearest filaments and the blend prints
 // as a speckle up the side. PrintMan feeds this shader an object-normalized Z (0 at the object's bottom
-// layer, 1 at its top) when the scene declares printman:colorObjectSpace, so the gradient spans the
+// layer, 1 at its top) when the surface shader declares inputs:objectSpace, so the gradient spans the
 // whole object regardless of how tall it is. Disp = 0: colour only, no displacement.
 shader printman_gradient(
     color Bottom = color(1, 0, 1),   // magenta (linear RGB) at the base

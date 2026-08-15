@@ -9,10 +9,15 @@
 # edge and corner is creased infinitely sharp, so the limit surface is the box itself rather than the rounded
 # blob a bare cube subdivides into -- the gradient then spans the full height with a flat base, so the very
 # bottom of the sweep (cyan) gets real wall instead of being eaten by a rounded taper.
-# printman:colorAllFilaments paints with the whole loaded palette (not a fixed pair); printman:colorObjectSpace
-# normalizes the hue sweep in Z so it spans the object; printman:colorDither blends each height across the two
-# nearest filaments. Load several distinct filaments to see the effect.
-def Mesh "cube"
+#
+# The OSL shader is bound the way USD models shading: a UsdShade Material whose `surface` terminal connects
+# to a Shader prim naming the compiled OSL shader (info:id). The colour behaviour is authored as inputs on
+# that shader: inputs:allFilaments paints with the whole loaded palette (not a fixed pair); inputs:objectSpace
+# normalizes the hue sweep in Z so it spans the object; inputs:dither blends each height across the two nearest
+# filaments. Load several distinct filaments to see the effect.
+def Mesh "cube" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
 {
     int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
     int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
@@ -23,8 +28,19 @@ def Mesh "cube"
     float[] creaseSharpnesses = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
     int[] cornerIndices = [0, 1, 2, 3, 4, 5, 6, 7]
     float[] cornerSharpnesses = [10, 10, 10, 10, 10, 10, 10, 10]
-    custom string printman:oslShader = "printman_spectrum"
-    custom bool printman:colorObjectSpace = true
-    custom bool printman:colorDither = true
-    custom bool printman:colorAllFilaments = true
+    rel material:binding = </cube/Material>
+
+    def Material "Material"
+    {
+        token outputs:surface.connect = </cube/Material/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_spectrum"
+            bool inputs:printman:objectSpace = true
+            bool inputs:printman:dither = true
+            bool inputs:printman:allFilaments = true
+            token outputs:out
+        }
+    }
 }

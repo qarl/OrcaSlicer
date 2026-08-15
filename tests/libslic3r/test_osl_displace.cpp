@@ -214,13 +214,13 @@ SCENARIO_METHOD(OslDisplaceFixture, "OSL shaders drive displacement through slic
 SCENARIO_METHOD(OslDisplaceFixture, "A USD prim's OSL shader imports and slices as the grid",
                 "[usd][subdiv][PrintMan][displace][osl][grid]")
 {
-    GIVEN("cube_grid.usda: a subdiv cube carrying printman:oslShader = printman_grid") {
+    GIVEN("cube_grid.usda: a subdiv cube whose UsdShade material binds printman_grid to displacement") {
         Model model; std::vector<float> zs; MeshSlicingParamsEx params;
         const ModelVolume *vol = load_cage(model, "cube_grid.usda", zs, params);
         REQUIRE(zs.size() > 10);
 
-        THEN("the importer read the shader and its bound off the prim") {
-            REQUIRE(vol->printman_scene->osl_shader == "printman_grid");
+        THEN("the importer resolved the displacement shader and its bound off the material") {
+            REQUIRE(vol->printman_scene->osl_displacement_shader == "printman_grid");
             REQUIRE(vol->printman_scene->osl_max_displacement == Catch::Approx(0.7875));
         }
 
@@ -234,7 +234,7 @@ SCENARIO_METHOD(OslDisplaceFixture, "A USD prim's OSL shader imports and slices 
             // Load by the prim's shader name (as PrintObjectSlice does). Uses the test's own shader
             // dir, which also stages printman_grid.oso, so this doesn't depend on cross-target macro
             // propagation; the slicer's own dir (PRINTMAN_OSL_SHADER_DIR) is exercised live in the GUI.
-            PrintMan::OslDisplaceShader osl(PRINTMAN_OSL_TEST_DIR, vol->printman_scene->osl_shader);
+            PrintMan::OslDisplaceShader osl(PRINTMAN_OSL_TEST_DIR, vol->printman_scene->osl_displacement_shader);
             PrintMan::DisplacementField osl_grid;
             osl_grid.max_magnitude = vol->printman_scene->osl_max_displacement;
             osl_grid.eval = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n) { return osl(p, n); };

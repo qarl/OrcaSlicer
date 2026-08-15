@@ -249,7 +249,7 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers an intermediate colour 
 
 // A continuous colour gradient must span the WHOLE object bottom-to-top, dithered up the side -- the
 // feature Karl asked to see. The colour is object-normalized in Z (t = 0 at the bottom layer, 1 at the
-// top) exactly as PrintObjectSlice's colorObjectSpace wrapper does, so the gradient scales with the
+// top) exactly as PrintObjectSlice's object-space wrapper does, so the gradient scales with the
 // object at any height and never saturates (the old "all cyan" bug). Cout = magenta at the base, cyan at
 // the top; dithered, so at height t a fraction ~t of the wall goes to cyan. Assert the cyan share climbs
 // monotonically from ~0 at the bottom to ~1 at the top -- the gradient spans the object. C++ lambda, no OSL.
@@ -1620,8 +1620,9 @@ SCENARIO_METHOD(UsdResourcesFixture, "PrintMan colour regenerates regions when a
 
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
-// cube_gradient.usda declares printman_gradient + colorObjectSpace + colorDither, so the slicer feeds the
-// shader an object-normalized Z and dithers magenta->cyan up the side. Filaments are set directly (NOT via
+// cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +
+// :dither, so the slicer feeds the shader an object-normalized Z and dithers magenta->cyan up the side.
+// Filaments are set directly (NOT via
 // PRINTMAN_DEBUG_COLOR), so the z-band fallback is unreachable -- only the real Cout path can colour this,
 // and if the .oso fails to load the scene stays single-region and the test fails loudly. Asserts the
 // gradient spans the object (a bottom-skewed region and a distinct top-skewed one) and that the dither
@@ -1690,8 +1691,8 @@ SCENARIO_METHOD(UsdResourcesFixture, "The OSL gradient shader colours the whole 
 }
 
 // End-to-end all-filament dithering through the REAL spectrum shader and the full process() pipeline.
-// cube_spectrum.usda declares printman_spectrum + colorAllFilaments + colorObjectSpace + colorDither, so
-// the slicer paints with EVERY loaded filament, dithering the hue sweep across the whole palette up the
+// cube_spectrum.usda binds printman_spectrum to material:surface with inputs:printman:allFilaments +
+// :objectSpace + :dither, so the slicer paints with EVERY loaded filament, dithering the hue sweep up the
 // object. Six distinct filaments loaded; no PRINTMAN_DEBUG_COLOR, so only the real Cout path can colour it.
 // Asserts the palette is genuinely distributed over the object's height: several filament regions receive
 // area and their area-weighted mean heights span a wide range (a low colour and a high colour).
