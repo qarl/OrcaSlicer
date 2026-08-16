@@ -223,9 +223,10 @@ SCENARIO_METHOD(UsdResourcesFixture, "The engine dithers an intermediate colour 
             }
         }
         WHEN("three filaments are loaded and the target sits between two of them") {
-            // Yellow (linear midpoint of red & green) over a red/green/blue palette: the two nearest are
-            // red & green, so the dither must mix those and never reach for blue -- the N>2 "multicolor"
-            // path (two-nearest selection over the whole palette).
+            // Yellow (linear midpoint of red & green) over a red/green/blue palette: it lies exactly on the
+            // red-green edge of the palette's gamut, so the coverage dither must reproduce it from red & green
+            // alone and give blue zero coverage (blue is the only filament with a Z component, and the target
+            // has none) -- the multi-filament coverage path must not smear an off-gamut-axis filament in.
             PrintMan::ColorField color3;
             color3.palette     = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 255, 0), FlushPredict::RGBColor(0, 0, 255)};
             color3.dither      = true;
@@ -1811,7 +1812,12 @@ SCENARIO_METHOD(UsdResourcesFixture, "The spectrum shader dithers across all loa
     }
     THEN("many filaments are used and their heights span the object (palette climbs the side)") {
         REQUIRE(used >= 4);        // at least four of the loaded filaments actually appear
-        REQUIRE(hi - lo > 0.5);    // and the painted colours are spread from low on the object to high
+        // The painted colours still span low-to-high, but the coverage dither (which mixes each target across
+        // ALL filaments, not just the two nearest) deliberately spreads every filament over the heights it
+        // helps reproduce, so the per-filament mean-height spread is smaller than the old two-nearest banding
+        // (measured ~0.39 here vs >0.5 before). The reproduced colour still climbs -- see the [gradient] test,
+        // where the reproduced cyan share sweeps 0.15 -> 0.89 bottom to top.
+        REQUIRE(hi - lo > 0.3);
     }
 }
 
