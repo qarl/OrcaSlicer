@@ -432,8 +432,10 @@ static void slice_cage_placement(const CageProto &cp,
         if (! core.empty()) {
             usd_subdiv::Cage     region = usd_subdiv::refine_region(cage, cp.vf, core, level);
             std::vector<std::array<float, 2>> tri_uv;   // per-triangle authored UV (empty if the cage has none)
-            indexed_triangle_set its    = triangulate_cage(region, cp.flip_winding,
-                                                           (color && bands_local) ? &tri_uv : nullptr);
+            // Colour AND a texture-driven displacement both need the authored UV; without it a height-map
+            // relief samples one constant texel per vertex (uniform inflation, not terrain).
+            const bool want_uv = (color && bands_local) || bool(displacement);
+            indexed_triangle_set its    = triangulate_cage(region, cp.flip_winding, want_uv ? &tri_uv : nullptr);
             for (Vec3f &v : its.vertices)
                 v = (m * v.cast<double>()).cast<float>();
             if (flip_det)
@@ -445,8 +447,8 @@ static void slice_cage_placement(const CageProto &cp,
                 if (displacement.eval_d)
                     shade = displacement.eval_d;
                 else
-                    shade = [&displacement](const V3 &p, const V3 &n, const V3 &, const V3 &) { return displacement.eval(p, n); };
-                const double moved = apply_displacement(its, shade);
+                    shade = [&displacement](const V3 &p, const V3 &n, const V3 &, const V3 &, double, double) { return displacement.eval(p, n); };
+                const double moved = apply_displacement(its, shade, tri_uv);   // tri_uv drives a height-map relief
                 // The field MUST stay within max_magnitude: the band's face selection was grown by
                 // exactly that (above), so a larger move means faces that displaced into this band
                 // were never selected and are silently missing from the slice. Warn in release too
@@ -590,11 +592,13 @@ std::vector<ExPolygons> slice_scene(
             throw_on_cancel();
         });
 
-    // Colour (Phase B): union each channel's per-face ribbons and clip them to the finished layer
-    // contour, so a layer carries the wall colour of its surface -- multiple channels per layer, a real
-    // within-layer pattern. Channels stay separate (small overlaps at a colour boundary are harmless);
-    // interior area beyond the ribbons is left on the default filament. A layer with no ribbons (e.g.
-    // covered only by an unclassified plain mesh) is simply left unassigned.
+    // Colour (Phase B): give each layer's outer-wall shell to the surface colour. Each channel's per-face
+    // ribbons are the colour VOTES. With wall_depth set, the shell (contour minus its inward offset by one
+    // wall depth -- the ring the printer extrudes as perimeters) is partitioned among the channels by nearest
+    // vote, so a claim spans the full wall depth (always >= one line wide, on flat or curved geometry) while
+    // keeping its tangential extent (the colour proportions). The base filament keeps only the hidden interior
+    // and any shell it genuinely voted. Without wall_depth the legacy thin-ribbon clip is used (fragile on a
+    // curve; a plain-mesh-only layer stays unassigned either way).
     if (do_color) {
         out_segmentation->assign(zs.size(), std::vector<ExPolygons>(npal));
         std::vector<std::vector<Polygons>> bands(zs.size(), std::vector<Polygons>(npal));
@@ -603,14 +607,38 @@ std::vector<ExPolygons> slice_scene(
                 for (size_t k = 0; k < npal; ++ k)
                     for (Polygon &poly : bloc[L][k])
                         bands[L][k].emplace_back(std::move(poly));
+        const double wall_depth = color.wall_depth;
         tbb::parallel_for(tbb::blocked_range<size_t>(0, zs.size()),
             [&](const tbb::blocked_range<size_t> &r) {
                 for (size_t L = r.begin(); L < r.end(); ++ L) {
                     if (out[L].empty())
                         continue;
-                    for (size_t k = 0; k < npal; ++ k)
-                        if (! bands[L][k].empty())
-                            (*out_segmentation)[L][k] = intersection_ex(union_ex(bands[L][k]), out[L]);
+                    if (wall_depth <= 0.0) {
+                        for (size_t k = 0; k < npal; ++ k)
+                            if (! bands[L][k].empty())
+                                (*out_segmentation)[L][k] = intersection_ex(union_ex(bands[L][k]), out[L]);
+                        throw_on_cancel();
+                        continue;
+                    }
+                    const ExPolygons interior = offset_ex(out[L], - scaled<float>(wall_depth));
+                    const ExPolygons shell     = interior.empty() ? out[L] : diff_ex(out[L], interior);
+                    // Each channel claims the shell behind its votes, grown inward by one wall depth and taken in
+                    // order so the claims stay disjoint (apply_segmentation steals each extruder against the
+                    // unmodified base, so overlaps would double-assign). One offset + one diff per channel; a
+                    // colour boundary can shift up to ~wall_depth toward the lower-index filament (acceptable).
+                    ExPolygons remaining = shell;
+                    for (size_t k = 0; k < npal && ! remaining.empty(); ++ k) {
+                        if (bands[L][k].empty())
+                            continue;
+                        const ExPolygons vote = intersection_ex(union_ex(bands[L][k]), shell);
+                        if (vote.empty())
+                            continue;
+                        ExPolygons claim = intersection_ex(offset_ex(vote, scaled<float>(wall_depth), jtSquare), remaining);
+                        if (claim.empty())
+                            continue;
+                        remaining = diff_ex(remaining, claim);
+                        (*out_segmentation)[L][k] = std::move(claim);
+                    }
                     throw_on_cancel();
                 }
             });

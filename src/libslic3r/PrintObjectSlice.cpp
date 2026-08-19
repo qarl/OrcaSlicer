@@ -87,6 +87,7 @@ static std::vector<ExPolygons> slice_volume(
     const std::function<void()>   &throw_on_cancel_callback,
     const std::function<void(size_t, size_t)> &report_progress = {},
     const std::vector<FlushPredict::RGBColor> *filament_colors = nullptr,
+    double                         printman_wall_depth = 0.0,
     std::vector<std::vector<ExPolygons>> *out_color_seg = nullptr)
 {
     std::vector<ExPolygons> layers;
@@ -120,7 +121,8 @@ static std::vector<ExPolygons> slice_volume(
                 load_osl(disp_name, disp_osl, "displacement");
                 if (disp_osl) {
                     disp.eval_d        = [&disp_osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
-                                                     const PrintMan::V3 &dPdx, const PrintMan::V3 &dPdy) { return (*disp_osl)(p, n, dPdx, dPdy); };
+                                                     const PrintMan::V3 &dPdx, const PrintMan::V3 &dPdy,
+                                                     double u, double v) { return (*disp_osl)(p, n, dPdx, dPdy, u, v); };
                     disp.max_magnitude = volume.printman_scene->osl_max_displacement;
                 }
             }
@@ -136,6 +138,7 @@ static std::vector<ExPolygons> slice_volume(
             // per-filament layer contours (out_color_seg). Channels map to the scene's resolved filament
             // ids in order (either its explicit list or, with color_all_filaments, every loaded filament).
             PrintMan::ColorField color;
+            color.wall_depth = printman_wall_depth;   // claim the outer-wall shell, not a thin ribbon (0 -> legacy)
             const unsigned int   n_loaded = filament_colors ? (unsigned int) filament_colors->size() : 0u;
             const std::vector<unsigned int> fil = PrintMan::resolved_filaments(*volume.printman_scene, n_loaded);
             if (out_color_seg && ! fil.empty()) {
@@ -167,15 +170,10 @@ static std::vector<ExPolygons> slice_volume(
                                                      const PrintMan::V3 &dx, const PrintMan::V3 &dy,
                                                      double u, double v) { return color_osl->color(p, n, dx, dy, u, v); };
                         }
-                        // Dither a continuous colour across the two nearest filaments (opt-in via the surface
-                        // shader's inputs:dither). Leave band_width at its default: the ribbon must be at least
-                        // one perimeter wide or it fails to claim the object's OUTER WALL, and the printed side
-                        // then reads as the base filament even though every channel is present (measured: a
-                        // 0.5 mm ribbon covers ~57% of the outer wall, 1.0 mm ~99% -- see the [coverage] test).
-                        // The dither's spatial granularity is dither_cell, independent of the ribbon width, so
-                        // a full-width ribbon still dithers. (The 1.0 mm default suits a ~0.4-0.5 mm perimeter;
-                        // a coarse nozzle wants band_width scaled to its line width -- a follow-up, since the
-                        // perimeter width is not resolved at this seam.)
+                        // Dither a continuous colour across the palette (opt-in via the surface shader's
+                        // inputs:dither); dither_cell is the spatial granularity, independent of band_width.
+                        // band_width is just the deposition ribbon; wall_depth (set above) is what claims the
+                        // outer-wall shell, so the colour owns the printed wall on a curve as well as a flat face.
                         color.dither = volume.printman_scene->color_dither;
                     }
                 }
@@ -271,7 +269,8 @@ static std::vector<VolumeSlices> slice_volumes_inner(
     const std::vector<PrintObjectRegions::LayerRangeRegions> &layer_ranges,
     const std::vector<float>                                 &zs,
     const std::function<void()>                              &throw_on_cancel_callback,
-    const std::function<void(size_t, size_t)>                &report_progress = {})
+    const std::function<void(size_t, size_t)>                &report_progress = {},
+    double                                                    printman_wall_depth = 0.0)
 {
     model_volumes_sort_by_id(model_volumes);
 
@@ -347,7 +346,7 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                     }
                     std::vector<std::vector<ExPolygons>> color_seg;
                     std::vector<ExPolygons>              sl =
-                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback, report_progress, &filament_palette, &color_seg);
+                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback, report_progress, &filament_palette, printman_wall_depth, &color_seg);
                     out.push_back({ model_volume->id(), std::move(sl), std::move(color_seg) });
                 }
             } else {
@@ -1323,12 +1322,35 @@ void PrintObject::slice_volumes()
     }
 
     std::vector<float>                   slice_zs      = zs_from_layers(m_layers);
+
+    // Amplified colour claims the outer-wall shell to a depth of one wall stack. Resolve that depth from the
+    // colour volume's region -- external+inner wall line widths and loop count, via the same perimeter Flow the
+    // walls print with -- so the claim matches the extruded wall on any nozzle/profile. Skip in vase mode (a
+    // multi-material spiral is rejected by validate; a single-material one has nothing to colour). 0 -> engine
+    // keeps the legacy thin-ribbon path.
+    double printman_wall_depth = 0.0;
+    if (print->config().filament_diameter.size() > 1 && ! print->config().spiral_mode) {
+        const PrintRegion *pr = nullptr;
+        for (const auto &lr : m_shared_regions->layer_ranges) {
+            for (const auto &vr : lr.volume_regions)
+                if (vr.model_volume && vr.model_volume->printman_scene && vr.region) { pr = vr.region; break; }
+            if (pr) break;
+        }
+        if (pr) {
+            const double lh    = this->config().layer_height.value;
+            const Flow   ext   = pr->flow(*this, frExternalPerimeter, lh, false);
+            const Flow   peri  = pr->flow(*this, frPerimeter, lh, false);
+            const int    loops = std::max(1, pr->config().wall_loops.value);
+            printman_wall_depth = 0.5 * ext.width() + ext.spacing() + peri.spacing() * (loops - 1);
+        }
+    }
+
     std::vector<VolumeSlices> objSliceByVolume;
     if (!slice_zs.empty()) {
         objSliceByVolume = slice_volumes_inner(
             print->config(), this->config(), this->trafo_centered(),
             this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback,
-            report_progress);
+            report_progress, printman_wall_depth);
     }
 
     // Amplified PrintMan colour: lift the engine's per-filament segmentation out of the first coloured

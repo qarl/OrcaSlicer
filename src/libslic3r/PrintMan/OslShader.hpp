@@ -145,8 +145,16 @@ public:
     double operator()(const V3 &point, const V3 &normal,
                       const V3 &dPdx, const V3 &dPdy) const
     {
+        return (*this)(point, normal, dPdx, dPdy, 0.0, 0.0);
+    }
+    // As above, plus the authored surface texture coordinate as OSL's u/v globals, so a displacement
+    // shader can texture(name, u, v) a height map. Without this a texture-driven relief samples one
+    // constant texel for every vertex (uniform inflation, not terrain).
+    double operator()(const V3 &point, const V3 &normal,
+                      const V3 &dPdx, const V3 &dPdy, double u, double v) const
+    {
         if (!m_sym) return 0.0;
-        OSL::ShadingContext *ctx = run(point, normal, dPdx, dPdy);
+        OSL::ShadingContext *ctx = run(point, normal, dPdx, dPdy, u, v);
         const void *adr = m_ss->symbol_address(*ctx, m_sym);
         return adr ? double(*reinterpret_cast<const float *>(adr)) : 0.0;
     }

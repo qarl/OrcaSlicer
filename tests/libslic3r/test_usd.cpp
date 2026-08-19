@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <map>
 
@@ -22,6 +23,7 @@
 #include "libslic3r/PrintMan/Engine.hpp"
 #include "libslic3r/PrintMan/Palette.hpp"
 #include "libslic3r/TriangleMeshSlicer.hpp"
+#include "libslic3r/SVG.hpp"
 
 using namespace Slic3r;
 
@@ -470,6 +472,126 @@ SCENARIO_METHOD(UsdResourcesFixture, "A dithered surface colour claims the objec
         THEN("a ribbon at least a perimeter wide colours most of the outer wall; the too-thin one does not") {
             REQUIRE(c10 > 0.85);           // the default 1.0 mm ribbon covers the visible side
             REQUIRE(c10 > c05 + 0.2);      // materially better than the thin ribbon that reads as one filament
+        }
+    }
+}
+
+// The curved-surface fix: with ColorField::wall_depth set, the colour claims the outer-WALL SHELL (a
+// wall-depth-deep ring, partitioned among channels by nearest vote), not a thin ribbon -- so a sphere's wall
+// prints its surface colour instead of the base filament. Driven directly through slice_scene with a lambda
+// ColorField (no OSL, no process(), always built) on the tracked UV-sphere cage. Asserts the segmentation the
+// fix produces: (1) the base filament is excluded from the visible shell; (2) every claim is at least one line
+// wide (so perimeter generation keeps it in colour); (3) an analytic +X/-X split lands on the correct side, not
+// smeared across the equator. wall_depth = 0 (the legacy thin ribbon) leaves most of the curved shell to base --
+// the mostly-base-filament regression this guards against.
+SCENARIO_METHOD(UsdResourcesFixture, "The wall-shell colour claim covers a curved outer wall", "[usd][subdiv][PrintMan][color][wallshell]")
+{
+    GIVEN("a UV-sphere cage sliced with a shell-deep colour claim") {
+        Model model; std::string message;
+        REQUIRE(load_usd(usd_path("sphere_earth.usda").c_str(), &model, message, nullptr, true));
+        const ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+
+        const Transform3d m = vol->get_matrix();
+        BoundingBoxf3 wbb;
+        for (const Vec3f &v : vol->mesh().its.vertices) wbb.merge(m * v.cast<double>());
+        std::vector<float> zs;
+        for (float z = float(wbb.min.z()) + 0.2f; z < float(wbb.max.z()) - 0.2f; z += 0.3f) zs.push_back(z);
+        REQUIRE(zs.size() > 8);
+        MeshSlicingParamsEx params; params.trafo = m; params.subdiv_tol = 0.1;
+        const double cx = wbb.center().x();
+        const double WD = 1.0;   // ~2 walls * 0.42 mm + margin
+
+        auto area = [](const ExPolygons &e){ double a = 0.0; for (const ExPolygon &p : e) a += p.area(); return a; };
+        auto run  = [&](const PrintMan::ColorField &color, std::vector<std::vector<ExPolygons>> &seg) {
+            return PrintMan::slice_scene(*vol->printman_scene, params, zs, [](){}, {}, {}, color, &seg);
+        };
+        auto shell_of = [&](const ExPolygons &layer) {
+            const ExPolygons interior = offset_ex(layer, - float(scale_(WD)));
+            return interior.empty() ? layer : diff_ex(layer, interior);
+        };
+
+        // (1)+(2): a longitude gradient across a 4-colour palette, shell-deep claim.
+        const int rgb[4][3] = {{255,0,0},{255,255,0},{0,255,0},{0,0,255}};
+        PrintMan::ColorField grad;
+        grad.palette = {{255,0,0},{255,255,0},{0,255,0},{0,0,255}};
+        grad.wall_depth = WD;
+        grad.eval = [&](const PrintMan::V3 &p, const PrintMan::V3&, const PrintMan::V3&, const PrintMan::V3&, double, double) {
+            const double t = (std::atan2(p[1] - wbb.center().y(), p[0] - cx) + M_PI) / (2.0 * M_PI);
+            const int i = std::min(3, int(t * 4.0));
+            return PrintMan::linear_from_srgb(FlushPredict::RGBColor(rgb[i][0], rgb[i][1], rgb[i][2]));
+        };
+        std::vector<std::vector<ExPolygons>> gseg;
+        const std::vector<ExPolygons> glayers = run(grad, gseg);
+        REQUIRE(gseg.size() == zs.size());
+
+        double shell_tot = 0, base_in_shell = 0, claim_tot = 0, claim_printable = 0;
+        for (size_t L = 0; L < zs.size(); ++ L) {
+            if (glayers[L].empty()) continue;
+            const ExPolygons shell = shell_of(glayers[L]);
+            ExPolygons allc; for (const ExPolygons &ch : gseg[L]) allc.insert(allc.end(), ch.begin(), ch.end());
+            shell_tot     += area(shell);
+            base_in_shell += area(diff_ex(shell, union_ex(allc)));
+            for (const ExPolygons &ch : gseg[L]) {
+                if (ch.empty()) continue;
+                claim_tot       += area(ch);
+                claim_printable += area(opening_ex(ch, float(scale_(0.21))));   // survives a one-line-width opening
+            }
+        }
+        WARN("curved shell: base share = " << (shell_tot > 0 ? base_in_shell / shell_tot : 1.0)
+             << ", claim printable = " << (claim_tot > 0 ? claim_printable / claim_tot : 0.0));
+
+        // Legacy thin ribbon (wall_depth = 0) for contrast: it leaves most of the curved shell to base.
+        PrintMan::ColorField legacy = grad; legacy.wall_depth = 0.0; legacy.band_width = 0.6;
+        std::vector<std::vector<ExPolygons>> lseg;
+        const std::vector<ExPolygons> llayers = run(legacy, lseg);
+        double lshell = 0, lbase = 0;
+        for (size_t L = 0; L < zs.size(); ++ L) {
+            if (llayers[L].empty()) continue;
+            const ExPolygons shell = shell_of(llayers[L]);
+            ExPolygons allc; for (const ExPolygons &ch : lseg[L]) allc.insert(allc.end(), ch.begin(), ch.end());
+            lshell += area(shell); lbase += area(diff_ex(shell, union_ex(allc)));
+        }
+
+        // The shell claim excludes base and stays printable, where the thin ribbon left the shell to base.
+        {
+            REQUIRE(shell_tot > 0.0);
+            REQUIRE(base_in_shell / shell_tot < 0.05);        // base filament kept out of the visible shell
+            REQUIRE(claim_printable / claim_tot > 0.85);      // every colour claim is >= one line width
+            REQUIRE(lbase / lshell > 0.30);                   // the legacy ribbon leaves the curved shell mostly base
+        }
+
+        // (3): an analytic +X -> red / -X -> blue split must land on the correct side (colour placement, which
+        // a coverage metric is blind to).
+        PrintMan::ColorField split;
+        split.palette = {{255,0,0},{0,0,255}};
+        split.wall_depth = WD;
+        split.eval = [cx](const PrintMan::V3 &p, const PrintMan::V3&, const PrintMan::V3&, const PrintMan::V3&, double, double) {
+            return p[0] > cx ? PrintMan::linear_from_srgb(FlushPredict::RGBColor(255,0,0))
+                             : PrintMan::linear_from_srgb(FlushPredict::RGBColor(0,0,255));
+        };
+        std::vector<std::vector<ExPolygons>> sseg;
+        const std::vector<ExPolygons> slayers = run(split, sseg);
+        double red_pos = 0, red_neg = 0, blue_pos = 0, blue_neg = 0;
+        for (size_t L = 0; L < zs.size(); ++ L) {
+            if (slayers[L].empty() || sseg[L].size() < 2) continue;
+            BoundingBox bb = get_extents(slayers[L]); bb.offset(scale_(5.0));
+            const coord_t X = scale_(cx);
+            Polygon pos({ {X, bb.min.y()}, {bb.max.x(), bb.min.y()}, {bb.max.x(), bb.max.y()}, {X, bb.max.y()} });
+            Polygon neg({ {bb.min.x(), bb.min.y()}, {X, bb.min.y()}, {X, bb.max.y()}, {bb.min.x(), bb.max.y()} });
+            red_pos  += area(intersection_ex(sseg[L][0], ExPolygons{ ExPolygon(pos) }));
+            red_neg  += area(intersection_ex(sseg[L][0], ExPolygons{ ExPolygon(neg) }));
+            blue_pos += area(intersection_ex(sseg[L][1], ExPolygons{ ExPolygon(pos) }));
+            blue_neg += area(intersection_ex(sseg[L][1], ExPolygons{ ExPolygon(neg) }));
+        }
+        WARN("split placement: red +X share = " << (red_pos/(red_pos+red_neg)) << ", blue -X share = " << (blue_neg/(blue_pos+blue_neg)));
+        // red claims the +X hemisphere and blue the -X, within a wall depth of the meridian (colour placement,
+        // which a coverage metric is blind to).
+        {
+            REQUIRE(red_pos + red_neg > 0.0);
+            REQUIRE(blue_pos + blue_neg > 0.0);
+            REQUIRE(red_pos  / (red_pos  + red_neg)  > 0.90);
+            REQUIRE(blue_neg / (blue_pos + blue_neg) > 0.90);
         }
     }
 }
@@ -1953,5 +2075,306 @@ SCENARIO_METHOD(UsdResourcesFixture, "Render the amplified surface colour to an 
         WARN("wrote /tmp/colorviz.ppm (" << rows.size() << " layers)");
     }
     REQUIRE(! rows.empty());
+}
+
+// Diagnostic: why does a sliced SPHERE read mostly-default-filament while a cube colours cleanly? Slice
+// sphere_earth with 8 filaments and, per height-fifth, measure the outer-ring area taken by the base
+// (region 0 = default extruder) vs the coloured regions. Expectation to test: the near-vertical MIDDLE band
+// is well coloured (low base), but the shallow TOP and BOTTOM caps -- which FFF prints as solid top/bottom
+// layers, not perimeter walls, and which the wall-ribbon colour path never touches -- stay base. Hidden;
+// needs the local earth.tx. [.spherecolor]
+SCENARIO_METHOD(UsdResourcesFixture, "Where does a sliced sphere lose its colour to the base filament", "[.spherecolor][osl]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("sphere_earth.usda").c_str(), &model, message, nullptr, true));
+    ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+    const std::vector<std::string> hexes = {"#00FFFF","#FF00FF","#FFFF00","#FFFFFF","#000000","#00FF00","#0000FF","#FF0000"};
+    DynamicPrintConfig config; config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>(hexes.size(), 1.75)));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(hexes));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+    Print print; print.apply(model, config);
+    REQUIRE(! print.objects().empty());
+    try { print.process(); } catch (const std::exception &e) { WARN("process threw: " << e.what()); }
+    const PrintObject *po = print.objects().front();
+    const size_t nR = po->num_printing_regions(), nL = po->layers().size();
+    auto area = [](const ExPolygons &e){ double a=0; for (const ExPolygon &p:e) a+=p.area(); return a; };
+    const int NB = 5; double base[NB]={0}, col[NB]={0};
+    std::vector<double> filring(nR, 0.0);   // total outer-ring area per filament region (0 = base/default)
+    for (size_t li=0; li<nL; ++li) {
+        const Layer *ly = po->layers()[li];
+        if (ly->lslices.empty()) continue;
+        const int b = std::min(NB-1, int(li*NB/nL));
+        const ExPolygons inner = offset_ex(ly->lslices, -float(scale_(0.45)));
+        const ExPolygons ring  = inner.empty() ? ly->lslices : diff_ex(ly->lslices, inner);
+        for (size_t i=0;i<nR && i<size_t(ly->region_count());++i) {
+            ExPolygons rs; for (const Surface &s: ly->get_region(int(i))->slices.surfaces) rs.push_back(s.expolygon);
+            const double a = area(intersection_ex(rs, ring));
+            filring[i]+=a;
+            if (i==0) base[b]+=a; else col[b]+=a;
+        }
+    }
+    for (int b=0;b<NB;++b){ const double t=base[b]+col[b]; WARN("height fifth "<<b<<" base(default) ring share = "<<(t>0?base[b]/t:0.0)); }
+    // Map each region to its ACTUAL filament id (config.outer_wall_filament_id, 1-based) -- region index is
+    // NOT filament index. Report the ring area per real filament.
+    const char *nm[8]={"cyan","magenta","yellow","white","black","green","blue","red"};
+    std::vector<double> byfil(9, 0.0);
+    for (const Layer *ly : po->layers()) {
+        if (ly->lslices.empty()) continue;
+        const ExPolygons inner = offset_ex(ly->lslices, -float(scale_(0.45)));
+        const ExPolygons ring  = inner.empty()? ly->lslices : diff_ex(ly->lslices, inner);
+        for (int i=0;i<int(nR) && i<ly->region_count();++i){
+            const int fid = ly->get_region(i)->region().config().outer_wall_filament_id.value; // 1-based
+            ExPolygons rs; for (const Surface &s: ly->get_region(i)->slices.surfaces) rs.push_back(s.expolygon);
+            if (fid>=1 && fid<=8) byfil[fid]+=area(intersection_ex(rs,ring));
+        }
+    }
+    double tot=0; for (double x:byfil) tot+=x;
+    for (int fid=1;fid<=8;++fid) WARN("ring FILAMENT "<<fid<<" ("<<nm[fid-1]<<") = "<<(tot>0?100*byfil[fid]/tot:0.0)<<"%");
+    (void)filring;
+
+    // EXPOSED TOP SURFACE per layer = area of this layer not covered by the layer above (the upward-facing
+    // skin -- the sphere's dome). Measure its base(default) vs coloured share: this is what the viewer sees
+    // on top, and what the wall-ribbon colour path never touches.
+    double topbase=0, topcol=0;
+    for (size_t li=0; li+1<nL; ++li) {
+        const Layer *ly=po->layers()[li], *up=po->layers()[li+1];
+        if (ly->lslices.empty()) continue;
+        const ExPolygons exposed = diff_ex(ly->lslices, up->lslices);   // faces up, not covered above
+        if (exposed.empty()) continue;
+        for (size_t i=0;i<nR && i<size_t(ly->region_count());++i){
+            ExPolygons rs; for (const Surface &s: ly->get_region(int(i))->slices.surfaces) rs.push_back(s.expolygon);
+            const double a=area(intersection_ex(rs, exposed));
+            if (i==0) topbase+=a; else topcol+=a;
+        }
+    }
+    WARN("EXPOSED TOP SURFACE: base(default) share = "<<(topbase+topcol>0?topbase/(topbase+topcol):0.0)
+         <<"  (base area "<<topbase<<" coloured "<<topcol<<")");
+
+    // Ground-truth strip: per layer bottom->top, the area-weighted blend of the outer-RING colour using the
+    // ACTUAL loaded filament colours (region i -> the i-th loaded filament). This is the validated colorviz
+    // proxy for what the GUI renders on the skin. Dump to /tmp/sphereviz.ppm.
+    const int rgb[8][3]={{0,255,255},{255,0,255},{255,255,0},{255,255,255},{0,0,0},{0,255,0},{0,0,255},{255,0,0}};
+    std::vector<std::array<int,3>> rows;
+    for (const Layer *ly : po->layers()) {
+        if (ly->lslices.empty()) { rows.push_back({30,30,30}); continue; }
+        const ExPolygons inner = offset_ex(ly->lslices, -float(scale_(0.45)));
+        const ExPolygons ring  = inner.empty()? ly->lslices : diff_ex(ly->lslices, inner);
+        double rt=0,rr=0,gg=0,bb=0;
+        for (int i=0;i<int(nR) && i<ly->region_count();++i){
+            const int fid = ly->get_region(i)->region().config().outer_wall_filament_id.value; // 1-based
+            if (fid<1 || fid>8) continue;
+            ExPolygons rs; for (const Surface &s: ly->get_region(i)->slices.surfaces) rs.push_back(s.expolygon);
+            const double a=area(intersection_ex(rs,ring));
+            rt+=a; rr+=a*rgb[fid-1][0]; gg+=a*rgb[fid-1][1]; bb+=a*rgb[fid-1][2];
+        }
+        rows.push_back(rt>0? std::array<int,3>{int(rr/rt),int(gg/rt),int(bb/rt)} : std::array<int,3>{30,30,30});
+    }
+    if (FILE *f=std::fopen("/tmp/sphereviz.ppm","w")){ const int W=120,H=int(rows.size());
+        std::fprintf(f,"P3\n%d %d\n255\n",W,H);
+        for(int y=0;y<H;++y){auto&c=rows[H-1-y];for(int x=0;x<W;++x)std::fprintf(f,"%d %d %d ",c[0],c[1],c[2]);std::fprintf(f,"\n");}
+        std::fclose(f); WARN("wrote /tmp/sphereviz.ppm ("<<rows.size()<<" layers)"); }
+    REQUIRE(nR >= 2);
+}
+
+// GROUND TRUTH: not slice area, but the ACTUAL generated external-perimeter extrusions (what becomes the
+// visible skin in G-code) attributed to each region's outer_wall_filament_id, plus the real exported G-code.
+// The slice-area diagnostic above said the sphere's outer ring is ~90% coloured, yet Karl sees a cyan ball.
+// If colored slices do NOT turn into colored external perimeters, the break is in perimeter generation on
+// the thin curved ribbons, not in the colour classification. Hidden; needs the local earth.tx. [.spheregcode]
+SCENARIO_METHOD(UsdResourcesFixture, "What tool actually prints the sphere's outer wall", "[.spheregcode][osl]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");
+    auto run = [&](const char *usdfile, const char *tag) {
+        Model model; std::string message;
+        REQUIRE(load_usd(usd_path(usdfile).c_str(), &model, message, nullptr, true));
+        model.add_default_instances();
+        model.center_instances_around_point(Vec2d(125.0, 125.0));
+        // Karl's actual 8 loaded filaments: C M Y K W R G B.
+        const std::vector<std::string> hexes = {"#00FFFF","#FF00FF","#FFFF00","#000000","#FFFFFF","#FF0000","#00FF00","#0000FF"};
+        DynamicPrintConfig config; config.apply(FullPrintConfig::defaults());
+        config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>(hexes.size(), 1.75)));
+        config.set_key_value("filament_colour",   new ConfigOptionStrings(hexes));
+        config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+        config.set_key_value("enable_prime_tower", new ConfigOptionBool(false));   // avoid wipe-tower flush matrix
+        config.set_key_value("flush_volumes_matrix", new ConfigOptionFloats(std::vector<double>(hexes.size()*hexes.size(), 0.0)));
+        config.set_key_value("flush_volumes_vector", new ConfigOptionFloats(std::vector<double>(hexes.size(), 0.0)));
+        Print print; print.apply(model, config);
+        REQUIRE(! print.objects().empty());
+        try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+        const PrintObject *po = print.objects().front();
+
+        // Recurse the perimeter tree to leaf paths/loops; sum length per role, keyed by the region's
+        // 1-based outer_wall_filament_id (the exact field ToolOrdering/GCode use to pick the wall tool).
+        std::function<void(const ExtrusionEntity*, double&, double&)> walk =
+            [&](const ExtrusionEntity *e, double &ext_len, double &other_len) {
+                if (const auto *c = dynamic_cast<const ExtrusionEntityCollection*>(e)) {
+                    for (const ExtrusionEntity *ch : c->entities) walk(ch, ext_len, other_len);
+                } else {
+                    if (e->role() == erExternalPerimeter) ext_len += e->length();
+                    else                                  other_len += e->length();
+                }
+            };
+        std::map<int,double> ext_by_fil, peri_by_fil;
+        double ext_total = 0.0;
+        for (const Layer *ly : po->layers())
+            for (int i = 0; i < ly->region_count(); ++i) {
+                const LayerRegion *lr = ly->get_region(i);
+                const int fid = lr->region().config().outer_wall_filament_id.value;   // 1-based
+                double ext = 0.0, other = 0.0;
+                for (const ExtrusionEntity *e : lr->perimeters.entities) walk(e, ext, other);
+                ext_by_fil[fid] += ext; peri_by_fil[fid] += ext + other; ext_total += ext;
+            }
+        const char *nm[9]={"?","cyan","magenta","yellow","white","black","green","blue","red"};
+        WARN("["<<tag<<"] EXTERNAL-PERIMETER length by wall filament (unscaled mm), total="<<unscale<double>(ext_total));
+        for (auto &kv : ext_by_fil) {
+            const int fid = kv.first;
+            WARN("  ["<<tag<<"] filament "<<fid<<" ("<<(fid>=1&&fid<=8?nm[fid]:"?")<<"): external="
+                 <<unscale<double>(kv.second)<<"mm  ("<<(ext_total>0?100.0*kv.second/ext_total:0.0)<<"% of outer wall)"
+                 <<"  allperi="<<unscale<double>(peri_by_fil[fid])<<"mm");
+        }
+
+        // (C)-DISCRIMINATOR 1: SLICE-AREA base share of the outer ring. If the colour is PRESENT in the
+        // segmentation slices (low slice-area base) but ABSENT from the wall (high perimeter base), the break
+        // is at perimeter generation / thin-region dropping, not colour coverage of the contour.
+        {
+            auto area = [](const ExPolygons &e){ double a=0; for (const ExPolygon &p:e) a+=p.area(); return a; };
+            double ring_base=0, ring_tot=0;
+            for (const Layer *ly : po->layers()) {
+                if (ly->lslices.empty()) continue;
+                const ExPolygons inner = offset_ex(ly->lslices, -float(scale_(0.45)));
+                const ExPolygons ring  = inner.empty()? ly->lslices : diff_ex(ly->lslices, inner);
+                for (int i=0;i<ly->region_count();++i){
+                    ExPolygons rs; for (const Surface &s: ly->get_region(i)->slices.surfaces) rs.push_back(s.expolygon);
+                    const double a = area(intersection_ex(rs, ring));
+                    ring_tot += a; if (i==0) ring_base += a;
+                }
+            }
+            WARN("  ["<<tag<<"] SLICE-AREA base share of outer ring = "<<(ring_tot>0?100*ring_base/ring_tot:0)
+                 <<"%   (vs perimeter base "<<(ext_total>0?100*ext_by_fil[1]/ext_total:0)<<"% : low here + high there ⇒ colour is in the SLICES but dropped at the WALL)");
+        }
+
+        // (C)-MECHANISM: is each COLOURED region too thin to hold an outer-wall line? A region only extrudes an
+        // external perimeter where it is at least ~one line width wide. opening by half a line width (0.21 mm)
+        // deletes anything narrower. If most coloured AREA is deleted on the sphere but survives on the cube,
+        // the coloured bands are sub-line-width on the curve and the perimeter generator drops them -> base wall.
+        {
+            auto area = [](const ExPolygons &e){ double a=0; for (const ExPolygon &p:e) a+=p.area(); return a; };
+            double col_area=0, col_openable=0;
+            for (const Layer *ly : po->layers())
+                for (int i=1;i<ly->region_count();++i){   // coloured regions only (skip base region 0)
+                    ExPolygons rs; for (const Surface &s: ly->get_region(i)->slices.surfaces) rs.push_back(s.expolygon);
+                    if (rs.empty()) continue;
+                    col_area     += area(rs);
+                    col_openable += area(opening_ex(rs, float(scale_(0.21))));   // survives = wide enough for a wall
+                }
+            WARN("  ["<<tag<<"] COLOURED region printable-width: "<<(col_area>0?100*col_openable/col_area:0)
+                 <<"% of coloured slice area is >= one line width (the rest is too thin to extrude an outer wall and is dropped to base)");
+        }
+
+        // (C)-DISCRIMINATOR 2: window-INDEPENDENT skin colour. Walk the true outer contour; step 0.2 mm inward
+        // (< one line width) and ask which region's slices own that surface point, weighted by contour length.
+        // This is "what colour is at the surface" with no radius window and no perimeter-generation quirks.
+        {
+            double skin_base=0, skin_tot=0;
+            for (const Layer *ly : po->layers()) {
+                for (const ExPolygon &ep : ly->lslices) {
+                    const Point c = ep.contour.centroid();
+                    const Points &pts = ep.contour.points;
+                    for (size_t j=0;j<pts.size();++j) {
+                        const Point &a=pts[j], &b=pts[(j+1)%pts.size()];
+                        const Point mid((a.x()+b.x())/2,(a.y()+b.y())/2);
+                        const double len = unscale<double>((b-a).cast<double>().norm());
+                        Vec2d dir = (unscaled<double>(c)-unscaled<double>(mid)); double dn=dir.norm(); if (dn<1e-9) continue; dir/=dn;
+                        const Point probe(mid.x()+scaled<coord_t>(dir.x()*0.2), mid.y()+scaled<coord_t>(dir.y()*0.2));
+                        int owner=-1;
+                        for (int i=0;i<ly->region_count();++i){
+                            for (const Surface &s: ly->get_region(i)->slices.surfaces)
+                                if (s.expolygon.contains(probe)) { owner=i; break; }
+                            if (owner>=0) break;
+                        }
+                        if (owner<0) continue;
+                        skin_tot+=len; if (owner==0) skin_base+=len;
+                    }
+                }
+            }
+            WARN("  ["<<tag<<"] SURFACE-SKIN base share (0.2mm inside true contour, length-weighted) = "<<(skin_tot>0?100*skin_base/skin_tot:0)<<"%   <- window-independent 'what the eye sees'");
+        }
+
+        // OUTERMOST-WALL truth: per layer, find each external-perimeter loop's mean XY radius from the
+        // object centre, and the layer's max radius. Split external length into the OUTER shell (within
+        // 0.55 mm of that layer's max radius -- the visible skin) vs BEHIND it. If the base cyan dominates
+        // the OUTER shell, the coloured wall is not outermost (rim/gap). If cyan dominates only BEHIND,
+        // it's a hidden double wall. Also count external loops per layer (≈2 ⇒ double wall).
+        Vec2d ctr(0,0); { BoundingBox bb; for (const Layer *ly : po->layers()) for (const auto &ep : ly->lslices) bb.merge(get_extents(ep)); ctr = unscaled<double>(bb.center()); }
+        const size_t NL = po->layers().size();
+        double outer_base=0, outer_col=0, behind_base=0, behind_col=0; long loops=0, layers=0;
+        const int NF=5; double fifth_base[NF]={0}, fifth_out[NF]={0};   // per-height-fifth OUTER-shell base vs total
+        for (size_t li=0; li<NL; ++li) {
+            const Layer *ly = po->layers()[li];
+            struct L { double r, len; bool base; };
+            std::vector<L> ll;
+            for (int i = 0; i < ly->region_count(); ++i) {
+                const LayerRegion *lr = ly->get_region(i);
+                const bool is_base = (i == 0);   // region 0 = the object default/base extruder (unambiguous)
+                std::function<void(const ExtrusionEntity*)> collect = [&](const ExtrusionEntity *e){
+                    if (const auto *c = dynamic_cast<const ExtrusionEntityCollection*>(e)) { for (auto *ch:c->entities) collect(ch); return; }
+                    if (e->role() != erExternalPerimeter) return;
+                    Polyline pl = e->as_polyline(); if (pl.points.empty()) return;
+                    double rr=0; for (const Point &p : pl.points) rr += (unscaled<double>(p)-ctr).norm();
+                    ll.push_back({rr/pl.points.size(), e->length(), is_base});
+                };
+                for (const ExtrusionEntity *e : lr->perimeters.entities) collect(e);
+            }
+            if (ll.empty()) continue;
+            ++layers; loops += (long)ll.size();
+            const int fi = std::min(NF-1, int(li*NF/NL));
+            double rmax=0; for (auto &x:ll) rmax=std::max(rmax,x.r);
+            for (auto &x:ll) {
+                const bool outer = x.r >= rmax - 0.55;
+                if (outer) { (x.base?outer_base:outer_col) += x.len; fifth_out[fi]+=x.len; if(x.base) fifth_base[fi]+=x.len; }
+                else       { (x.base?behind_base:behind_col) += x.len; }
+            }
+        }
+        const double ot = outer_base+outer_col, bt = behind_base+behind_col;
+        WARN("  ["<<tag<<"] OUTER shell external: BASE(region0)="<<(ot>0?100*outer_base/ot:0)<<"%  coloured="<<(ot>0?100*outer_col/ot:0)
+             <<"%   BEHIND shell: base="<<(bt>0?100*behind_base/bt:0)<<"% coloured="<<(bt>0?100*behind_col/bt:0)<<"%");
+        for (int f=0; f<NF; ++f) WARN("    ["<<tag<<"] height fifth "<<f<<" (0=bottom) OUTER base share = "<<(fifth_out[f]>0?100*fifth_base[f]/fifth_out[f]:0)<<"%");
+        WARN("  ["<<tag<<"] avg external loops/layer = "<<(layers?double(loops)/layers:0)<<"  (1 ⇒ clean single wall; >>1 ⇒ ring shattered into islands)");
+
+        // Believe the artifact: dump one equator and one near-top layer showing the layer contour (black),
+        // the BASE region-0 slices (red), and the coloured region slices (green). Red touching the black
+        // contour = base owning the visible surface. sphere run only, default band_width.
+        if (std::string(tag)=="sphere" && !std::getenv("PRINTMAN_BAND_WIDTH")) {
+            const size_t NLL = po->layers().size();
+            for (auto pr : {std::pair<const char*,size_t>{"equator", NLL/2}, {"neartop", (4*NLL)/5}}) {
+                const Layer *ly = po->layers()[pr.second];
+                BoundingBox bb; for (const auto &ep : ly->lslices) bb.merge(get_extents(ep));
+                const std::string sp = std::string("/private/tmp/claude-502/-Users-qarl-project-printman/"
+                    "fd6fae7d-578a-4fd3-9bd4-bfae3cd982b6/scratchpad/sphere_")+pr.first+".svg";
+                SVG svg(sp, bb);
+                for (int i=0;i<ly->region_count();++i){
+                    ExPolygons rs; for (const Surface &s : ly->get_region(i)->slices.surfaces) rs.push_back(s.expolygon);
+                    svg.draw(rs, i==0?"red":"green", 0.5f);
+                }
+                svg.draw_outline(ly->lslices, "black", "black", scale_(0.08));
+                svg.Close();
+                WARN("["<<tag<<"] wrote "<<sp<<" (layer "<<pr.second<<"/"<<NLL<<")");
+            }
+        }
+
+        // The real artifact: exported G-code. Count extruded filament (E advance) inside ;TYPE:Outer wall
+        // per active tool (T0..T7). This is exactly what the printer would lay down as the visible skin.
+        const std::string gpath = std::string("/private/tmp/claude-502/-Users-qarl-project-printman/"
+            "fd6fae7d-578a-4fd3-9bd4-bfae3cd982b6/scratchpad/") + tag + ".gcode";
+        try { print.export_gcode(gpath, nullptr, nullptr); WARN("["<<tag<<"] wrote "<<gpath); }
+        catch (const std::exception &e) { WARN("["<<tag<<"] export_gcode threw: "<<e.what()); }
+    };
+    run("sphere_earth_disp.usda", "sphere");       // 80 mm earth sphere with amplified elevation displacement
+    SUCCEED();
 }
 #endif // SLIC3R_OSL

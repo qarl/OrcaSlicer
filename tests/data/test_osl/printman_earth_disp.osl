@@ -1,0 +1,18 @@
+// Displacement: amplified relief from a real Earth ELEVATION DEM (earth_height.tx, decoded from Mapzen
+// Terrarium SRTM/GEBCO tiles, reprojected to the same equirectangular frame as the colour map). The DEM
+// is normalized 0..1 with sea level and everything below it clamped to 0 -> oceans are dead flat; land
+// rises with true relative elevation, Himalaya/Andes/Rockies highest. Amp is the mm amplification (real
+// relief is invisible at print scale). Gamma < 1 lifts the lowlands so whole continents read as raised
+// landmasses rather than only the peaks. The downward-facing base cap is left flat so the globe sits ON
+// the plate instead of the (high) south pole punching through it.
+shader printman_earth_disp(
+    float Amp   = 10.0,   // mm at the highest peak (40mm globe: gentle relief to match small size)
+    float Gamma = 1.0,    // 1 = true elevation; <1 lifts lowlands for readability
+    output float Disp = 0.0)
+{
+    if (N[2] < -0.6) { Disp = 0.0; }             // flat base on the plate (downward cap)
+    else {
+        color hc = texture("earth_height.tx", u, 1.0 - v, "width", 0.0, "blur", 0.0);
+        Disp = Amp * pow(max(0.0, hc[0]), Gamma);
+    }
+}

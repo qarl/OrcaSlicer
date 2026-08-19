@@ -32,7 +32,8 @@ using DisplaceShader = std::function<double(const V3 &point, const V3 &normal)>;
 // face's two edges), so a shader can band-limit (filterwidth/texture). apply_displacement always calls
 // this form; a plain DisplaceShader is bridged to it by ignoring the derivatives.
 using DisplaceShaderD = std::function<double(const V3 &point, const V3 &normal,
-                                             const V3 &dPdx, const V3 &dPdy)>;
+                                             const V3 &dPdx, const V3 &dPdy,
+                                             double u, double v)>;
 
 // ---- ported displacement shaders (printman/shade.py) --------------------------------------
 
@@ -143,7 +144,7 @@ inline std::vector<V3> per_face_average(const indexed_triangle_set &its, const C
             const V3 e2{{double(c.x()) - a.x(), double(c.y()) - a.y(), double(c.z()) - a.z()}};
             for (int k = 0; k < 3; ++k) {
                 const Vec3f &vk = its.vertices[t[k]];
-                fc[f][k] = contrib(V3{{double(vk.x()), double(vk.y()), double(vk.z())}}, fn, e1, e2);
+                fc[f][k] = contrib(V3{{double(vk.x()), double(vk.y()), double(vk.z())}}, fn, e1, e2, f);
             }
         }
     });
@@ -165,9 +166,13 @@ inline std::vector<V3> per_face_average(const indexed_triangle_set &its, const C
 // watertight (one position per shared vertex, no crack), faithful to normal-dependent shaders
 // (each face's real orientation), and auto-damping at edges (the averaged vector shrinks where
 // the incident normals diverge). Returns max |displacement|.
-inline double apply_displacement(indexed_triangle_set &its, const DisplaceShaderD &shader) {
-    const std::vector<V3> dv = per_face_average(its, [&](const V3 &p, const V3 &n, const V3 &dPdx, const V3 &dPdy) {
-        const double d = shader(p, n, dPdx, dPdy);
+inline double apply_displacement(indexed_triangle_set &its, const DisplaceShaderD &shader,
+                                 const std::vector<std::array<float, 2>> &tri_uv = {}) {
+    const bool have_uv = tri_uv.size() == its.indices.size();   // authored per-face UV (for a texture-driven relief)
+    const std::vector<V3> dv = per_face_average(its, [&](const V3 &p, const V3 &n, const V3 &dPdx, const V3 &dPdy, size_t f) {
+        const double u = have_uv ? double(tri_uv[f][0]) : 0.0;
+        const double v = have_uv ? double(tri_uv[f][1]) : 0.0;
+        const double d = shader(p, n, dPdx, dPdy, u, v);
         return V3{{d * n[0], d * n[1], d * n[2]}};
     });
     double maxd = 0.0;

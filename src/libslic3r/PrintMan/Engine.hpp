@@ -33,6 +33,7 @@ struct ColorField {
     std::function<V3(const V3 &point, const V3 &normal, const V3 &dPdx, const V3 &dPdy, double u, double v)> eval;
     std::vector<FlushPredict::RGBColor> palette;
     double band_width  = 1.0;    // mm: width of the colour ribbon deposited along a wall (>= a few perimeters)
+    double wall_depth  = 0.0;    // mm: depth of the outer-wall shell the colour claims; 0 -> legacy thin-ribbon clip
     bool   dither      = false;  // spatially dither Cout across the two nearest filaments, else hard quantize
     double dither_cell = 0.5;    // mm: dither pattern cell (~ a line width); ignored unless `dither`
     explicit operator bool() const { return bool(eval) && ! palette.empty(); }

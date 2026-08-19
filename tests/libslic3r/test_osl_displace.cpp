@@ -26,6 +26,7 @@
 #include "libslic3r/SVG.hpp"
 #include "libslic3r/PrintMan/Engine.hpp"
 #include "libslic3r/PrintMan/OslShader.hpp"
+#include "libslic3r/PrintMan/Palette.hpp"
 #include "libslic3r/Format/USDSubdiv.hpp"
 #include <array>
 
@@ -393,7 +394,7 @@ SCENARIO("Grid colour through the amplification engine -- per-layer distribution
 
     PrintMan::DisplacementField disp;
     disp.max_magnitude = vol->printman_scene->osl_max_displacement;
-    disp.eval_d = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dx, const PrintMan::V3 &dy) { return osl(p, n, dx, dy); };
+    disp.eval_d = [&osl](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dx, const PrintMan::V3 &dy, double u, double v) { return osl(p, n, dx, dy, u, v); };
 
     PrintMan::ColorField color;
     color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 0, 255)};
@@ -452,6 +453,10 @@ SCENARIO("earth texture maps onto the sphere through authored face-varying UV", 
     std::vector<std::array<unsigned char, 3>> img(size_t(W) * H, {{20, 20, 30}});
     std::vector<double>                       depth(size_t(W) * H, 1e9);
     auto s2b = [](double x) { x = x < 0 ? 0 : (x > 1 ? 1 : x); return (unsigned char)(std::pow(x, 1.0 / 2.2) * 255.0 + 0.5); };
+    // 8 cube-corner filaments (as the GUI would have loaded), and their sRGB bytes for the mosaic output.
+    const std::vector<FlushPredict::RGBColor> palette = {
+        {0,255,255},{255,0,255},{255,255,0},{255,255,255},{0,0,0},{0,255,0},{0,0,255},{255,0,0}};
+    const int prgb[8][3] = {{0,255,255},{255,0,255},{255,255,0},{255,255,255},{0,0,0},{0,255,0},{0,0,255},{255,0,0}};
     int coloured = 0;
     for (int f = 0; f < cage.nfaces(); ++ f) {
         const int s = cage.foff[f], e = cage.foff[f + 1];
@@ -472,7 +477,11 @@ SCENARIO("earth texture maps onto the sphere through authored face-varying UV", 
         const size_t idx = size_t(py) * W + px;
         if (c[1] < depth[idx]) {   // nearest front face wins
             depth[idx] = c[1];
-            img[idx]   = {{s2b(col[0]), s2b(col[1]), s2b(col[2])}};
+            // The actual pipeline colour: dither this face's Cout to a filament, draw that filament's colour.
+            const int k = PrintMan::dither_filament(col, palette, PrintMan::dither_hash(PrintMan::V3{{c[0],c[1],c[2]}}, 0.5));
+            if (k >= 0) img[idx] = {{(unsigned char)prgb[k][0], (unsigned char)prgb[k][1], (unsigned char)prgb[k][2]}};
+            else        img[idx] = {{s2b(col[0]), s2b(col[1]), s2b(col[2])}};
+            (void)s2b;
             ++ coloured;
         }
     }
