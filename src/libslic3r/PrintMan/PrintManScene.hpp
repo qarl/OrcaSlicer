@@ -57,6 +57,10 @@ struct PrintManScene
     std::string osl_surface_shader;         // material:surface      -> Cout (colour)
     std::string osl_displacement_shader;    // material:displacement -> Disp (relief)
     double      osl_max_displacement = 0.0;
+    // Where this scene's compiled shaders (.oso) and texture maps (.tx) live. Empty = the built-in
+    // PRINTMAN_OSL_SHADER_DIR. A self-contained .usdz bundles them, so the loader extracts them once to a
+    // cache dir and records it here, and the whole model -- geometry, shaders, maps -- is one portable file.
+    std::string osl_shader_searchpath;
 
     // Colour: the 1-based filament ids this scene paints with. Empty = single-filament (no colour).
     // When set, slice_scene also emits per-filament contours and the object is split into one print

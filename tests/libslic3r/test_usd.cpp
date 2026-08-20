@@ -24,6 +24,10 @@
 #include "libslic3r/PrintMan/Palette.hpp"
 #include "libslic3r/TriangleMeshSlicer.hpp"
 #include "libslic3r/SVG.hpp"
+#include <filesystem>
+#ifdef SLIC3R_OSL
+#include "libslic3r/PrintMan/OslShader.hpp"   // load the bundled shaders from the extracted searchpath
+#endif
 
 using namespace Slic3r;
 
@@ -2376,5 +2380,46 @@ SCENARIO_METHOD(UsdResourcesFixture, "What tool actually prints the sphere's out
     };
     run("sphere_earth_disp.usda", "sphere");       // 80 mm earth sphere with amplified elevation displacement
     SUCCEED();
+}
+
+// A self-contained .usdz -- geometry + both OSL shaders (.oso) + both texture maps (.tx) in one package --
+// must slice from its own bundle: the loader extracts the shaders/maps to a filesystem searchpath, and the
+// slice path loads them from there instead of the built-in dir. Proves shaders-and-maps-in-the-USD end to end.
+TEST_CASE("A self-contained .usdz slices from its bundled shaders and maps", "[usd][printman][osl][usdz]")
+{
+    // selfcontained_mini.usdz bundles a cube cage, a procedural surface shader (printman_gradient), a
+    // displacement shader (printman_earth_disp) and the height map it samples (earth_height.tx) -- all in
+    // one package, nothing on the built-in shader path.
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("selfcontained_mini.usdz").c_str(), &model, message, nullptr, /*amplify=*/true));
+    REQUIRE(! model.objects.empty());
+    REQUIRE(! model.objects.front()->volumes.empty());
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    const auto &sc = *vol->printman_scene;
+
+    // Both UsdShade terminals were bound from inside the package.
+    CHECK(sc.osl_surface_shader      == "printman_gradient");
+    CHECK(sc.osl_displacement_shader == "printman_earth_disp");
+    CHECK(sc.osl_max_displacement    == Catch::Approx(5.0));
+
+    // The loader extracted the bundled shaders + map to a real searchpath (not the built-in dir).
+    REQUIRE_FALSE(sc.osl_shader_searchpath.empty());
+    const std::filesystem::path dir(sc.osl_shader_searchpath);
+    REQUIRE(std::filesystem::is_directory(dir));
+    for (const char *a : {"printman_gradient.oso", "printman_earth_disp.oso", "earth_height.tx"}) {
+        INFO("bundled asset " << a);
+        CHECK(std::filesystem::exists(dir / a));
+    }
+
+    // The bundled shaders load from that searchpath: the surface shader carries a colour output; the
+    // displacement shader evaluates (its texture() resolves earth_height.tx on the same path). A missing
+    // .oso would throw in the constructor; the eval must stay finite.
+    PrintMan::OslDisplaceShader surf(sc.osl_shader_searchpath, "printman_gradient");
+    CHECK(surf.has_color());
+    PrintMan::OslDisplaceShader disp(sc.osl_shader_searchpath, "printman_earth_disp");
+    const double d = disp(PrintMan::V3{{0.0, 0.0, 10.0}}, PrintMan::V3{{0.0, 0.0, 1.0}},
+                          PrintMan::V3{{0, 0, 0}}, PrintMan::V3{{0, 0, 0}}, 0.3, 0.6);
+    CHECK(std::isfinite(d));
 }
 #endif // SLIC3R_OSL

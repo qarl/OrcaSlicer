@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <optional>
@@ -19,6 +20,7 @@
 #include <pxr/usd/usd/prim.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/stage.h>
+#include <pxr/usd/sdf/zipFile.h>          // SdfZipFile: read the .oso/.tx bundled in a self-contained .usdz
 #include <pxr/usd/usdGeom/cone.h>
 #include <pxr/usd/usdGeom/cube.h>
 #include <pxr/usd/usdGeom/cylinder.h>
@@ -1126,6 +1128,53 @@ indexed_triangle_set scene_proxy_boxes(const PrintMan::PrintManScene &scene)
 // (what arrange and ensure_on_bed read), and the scene is re-expressed in the centred frame
 // add_volume introduces (-mesh_offset), so the +off in get_matrix() cancels instead of double-
 // shifting params.trafo * get_matrix(). Shared by the instancing and standalone-cage paths.
+// A self-contained .usdz bundles this model's OSL shaders (.oso) and texture maps (.tx) beside the
+// geometry, so one file is the whole thing. USD reads the geometry from inside the package, but OSL and
+// OIIO resolve shaders/textures on a *filesystem* searchpath -- so the bundled assets are extracted once
+// to a cache dir keyed by the package (name + size + mtime, so re-authoring the same path re-extracts),
+// reused across slices. Returns that dir, or empty when `path` is not a usdz or bundles no such assets
+// (then the built-in PRINTMAN_OSL_SHADER_DIR is used). usdz stores its files uncompressed, so each entry's
+// bytes are written straight out.
+static std::string extract_usdz_shader_assets(const char *path)
+{
+    namespace fs = boost::filesystem;
+    if (path == nullptr)
+        return {};
+    const std::string p = path;
+    if (p.size() < 5 || p.compare(p.size() - 5, 5, ".usdz") != 0)
+        return {};                                   // a plain .usda/.usdc names built-in shaders by id
+    SdfZipFile zip = SdfZipFile::Open(p);
+    if (! zip)
+        return {};
+
+    boost::system::error_code ec;
+    const auto        sz  = fs::file_size(p, ec);
+    const std::time_t mt  = fs::last_write_time(p, ec);
+    const fs::path    dir = fs::temp_directory_path(ec) / "printman_osl"
+                          / (fs::path(p).stem().string() + "_" + std::to_string((unsigned long long) sz)
+                                                         + "_" + std::to_string((long long) mt));
+    bool any = false;
+    for (auto it = zip.begin(), e = zip.end(); it != e; ++it) {
+        const std::string    fname = *it;
+        const std::string::size_type dot = fname.rfind('.');
+        const std::string    ext = (dot == std::string::npos) ? std::string() : fname.substr(dot);
+        if (ext != ".oso" && ext != ".tx" && ext != ".exr" && ext != ".png" && ext != ".jpg")
+            continue;                                // the .usd layer(s) are read by USD from the package
+        const SdfZipFile::FileInfo info = it.GetFileInfo();
+        if (info.size != info.uncompressedSize)
+            continue;                                // usdz entries are stored; skip a compressed one
+        const fs::path out = dir / fs::path(fname).filename();
+        if (fs::exists(out, ec) && fs::file_size(out, ec) == info.uncompressedSize) { any = true; continue; }
+        fs::create_directories(out.parent_path(), ec);
+        std::ofstream os(out.string(), std::ios::binary);
+        os.write(it.GetFile(), std::streamsize(info.uncompressedSize));
+        if (os) any = true;
+        else BOOST_LOG_TRIVIAL(error) << "PrintMan: failed to extract bundled shader asset '" << fname
+                                      << "' from " << p;
+    }
+    return any ? dir.string() : std::string();
+}
+
 ModelVolume *add_scene_volume(Model *model, ModelObject *object, const std::string &name,
                               const char *path, PrintMan::PrintManScene &&scene)
 {
@@ -1144,6 +1193,9 @@ ModelVolume *add_scene_volume(Model *model, ModelObject *object, const std::stri
     // contours and the object splits into two extruder regions -- a hardcoded Z-band two-tone, no shader.
     if (std::getenv("PRINTMAN_DEBUG_COLOR"))
         scene.filaments = {1, 2};
+    // If this model bundles its shaders/maps (a self-contained .usdz), slice against the extracted copy.
+    if (! scene.osl_surface_shader.empty() || ! scene.osl_displacement_shader.empty())
+        scene.osl_shader_searchpath = extract_usdz_shader_assets(path);
     volume->printman_scene = std::move(scene);
     return volume;
 }
