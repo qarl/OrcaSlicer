@@ -61,6 +61,29 @@
 		<dict>
 			<key>CFBundleTypeExtensions</key>
 			<array>
+			<string>usd</string>
+			<string>USD</string>
+			<string>usda</string>
+			<string>USDA</string>
+			<string>usdc</string>
+			<string>USDC</string>
+			<string>usdz</string>
+			<string>USDZ</string>
+			</array>
+			<key>CFBundleTypeIconFile</key>
+			<string>images/OrcaSlicer.icns</string>
+			<key>CFBundleTypeName</key>
+			<string>USD</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LISsAppleDefaultForType</key>
+			<true/>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+		</dict>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
 			<string>obj</string>
 			<string>OBJ</string>
 			</array>
