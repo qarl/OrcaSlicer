@@ -15,6 +15,7 @@
 #include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
 #include "PrintMan/Engine.hpp"
 #ifdef SLIC3R_OSL
+#include <memory>
 #include <optional>
 #include "PrintMan/OslShader.hpp"
 #endif
@@ -101,6 +102,9 @@ static std::vector<ExPolygons> slice_volume(
             MeshSlicingParamsEx params2 { params };
             params2.trafo = params.trafo * volume.get_matrix();
             PrintMan::DisplacementField disp;
+            // Region displacement fields, one per scene.extra_materials entry (material k+1, selected by the
+            // cage's per-face tag); empty on a non-OSL build or where a region binds no displacement shader.
+            std::vector<PrintMan::DisplacementField> extra_disp;
 #ifdef SLIC3R_OSL
             // The prim's UsdShade material binds up to two OSL shaders, one per terminal. The displacement
             // shader (material:displacement) is evaluated per refined surface point for the relief; the surface
@@ -141,6 +145,28 @@ static std::vector<ExPolygons> slice_volume(
             const PrintMan::OslDisplaceShader *color_osl =
                 surf_osl ? &*surf_osl
                          : (! surf_name.empty() && surf_name == disp_name && disp_osl ? &*disp_osl : nullptr);
+
+            // A UsdGeomSubset can bind a different material to a face region, so build one displacement field
+            // per region material -- aligned so extra_disp[k] is material k+1, the cage's face_material tag.
+            // Each field owns its OSL shader via a shared_ptr, so it outlives this scope with no dangling
+            // capture; a region with no displacement shader (or a load failure) contributes an empty field
+            // (that region slices flat). Colour stays whole-surface (material 0) until region colour lands.
+            extra_disp.reserve(volume.printman_scene->extra_materials.size());
+            for (const PrintMan::MaterialShaders &mat : volume.printman_scene->extra_materials) {
+                PrintMan::DisplacementField f;
+                if (! mat.displacement.empty()) {
+                    try {
+                        auto sh = std::make_shared<PrintMan::OslDisplaceShader>(osl_dir, mat.displacement);
+                        f.eval_d = [sh](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dPdx,
+                                        const PrintMan::V3 &dPdy, double u, double v) { return (*sh)(p, n, dPdx, dPdy, u, v); };
+                        f.max_magnitude = mat.max_displacement;
+                    } catch (const std::exception &e) {
+                        BOOST_LOG_TRIVIAL(error) << "PrintMan: could not load OSL displacement shader '"
+                            << mat.displacement << "' for a region material: " << e.what() << "; slicing that region flat.";
+                    }
+                }
+                extra_disp.push_back(std::move(f));
+            }
 #endif
             // Colour: classify each refined face into a filament channel so the scene splits into
             // per-filament layer contours (out_color_seg). Channels map to the scene's resolved filament
@@ -199,7 +225,7 @@ static std::vector<ExPolygons> slice_volume(
             }
             std::vector<std::vector<ExPolygons>> color_seg;
             layers = PrintMan::slice_scene(*volume.printman_scene, params2, zs, throw_on_cancel_callback, report_progress, disp,
-                                           color, color ? &color_seg : nullptr);
+                                           color, color ? &color_seg : nullptr, extra_disp);
             if (out_color_seg)
                 *out_color_seg = std::move(color_seg);
             throw_on_cancel_callback();

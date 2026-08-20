@@ -46,6 +46,9 @@ struct ColorField {
 // out_segmentation (when non-null AND a ColorField is given): filled with [layer][channel] contours,
 // channel k = color.palette[k]. Each channel gets the wall ribbons of its colour clipped to the layer
 // (a within-layer pattern); the merged per-layer contours are returned as usual, unaffected by colour.
+// `displacement` is material 0 (the whole surface, or the fallback for any face in no subset);
+// `extra_displacements[k]` is material k+1, selected per control face by SubdivCage::face_material.
+// Empty -> single material, the pre-subset path unchanged. Colour is still whole-surface (material 0).
 std::vector<ExPolygons> slice_scene(
     const PrintManScene         &scene,
     const MeshSlicingParamsEx   &params,
@@ -54,7 +57,8 @@ std::vector<ExPolygons> slice_scene(
     const std::function<void(size_t, size_t)> &report_progress = {},
     const DisplacementField     &displacement = {},
     const ColorField            &color = {},
-    std::vector<std::vector<ExPolygons>> *out_segmentation = nullptr);
+    std::vector<std::vector<ExPolygons>> *out_segmentation = nullptr,
+    const std::vector<DisplacementField> &extra_displacements = {});
 
 }} // namespace Slic3r::PrintMan
 

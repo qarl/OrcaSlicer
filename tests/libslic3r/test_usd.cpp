@@ -1803,6 +1803,59 @@ TEST_CASE("UsdGeomSubset face bindings become per-region materials on the cage",
     }
 }
 
+// Multi-material displacement end to end: with a per-face material tag and one displacement field per
+// material, the core displaces each region through its own shader. cube_two_materials.usda tags the top
+// face material 1; giving material 1 a constant outward push (and nothing elsewhere) must lift the top,
+// extending the sliced geometry above the plain cube, while a single-material slice of the same scene does
+// not. C++ displacement fields, so this exercises the engine wiring (ctag -> N BridgeShaders) without OSL.
+TEST_CASE("Per-region displacement lifts only the tagged material's faces", "[usd][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_two_materials.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    const PrintMan::PrintManScene &scene = *vol->printman_scene;
+    REQUIRE(scene.extra_materials.size() == 2);   // material 1 = relief (top face), material 2 = flat (side)
+
+    const Transform3d m = vol->get_matrix();
+    float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+    for (const Vec3f &v : vol->mesh().its.vertices) {
+        const float z = float((m * v.cast<double>()).z());
+        zmin = std::min(zmin, z); zmax = std::max(zmax, z);
+    }
+    // Slice from just above the bed to a few mm past the cube top, so any lifted geometry is captured.
+    std::vector<float> zs;
+    for (float z = zmin + 0.1f; z < zmax + 3.0f; z += 0.2f) zs.push_back(z);
+    REQUIRE(zs.size() > 10);
+
+    MeshSlicingParamsEx params;
+    params.trafo      = m;
+    params.subdiv_tol = 0.05;
+
+    auto top_nonempty = [&](const std::vector<PrintMan::DisplacementField> &extra) {
+        const std::vector<ExPolygons> layers = PrintMan::slice_scene(
+            scene, params, zs, [](){}, {}, PrintMan::DisplacementField{}, PrintMan::ColorField{}, nullptr, extra);
+        int top = -1;
+        for (int i = 0; i < int(layers.size()); ++ i)
+            if (! layers[i].empty()) top = i;
+        return top;
+    };
+
+    // Baseline: no region displacement -> the plain (undisplaced) cube.
+    const int base_top = top_nonempty({});
+    REQUIRE(base_top >= 0);
+
+    // Push material 1 (the top face) +2 mm along its normal; material 2 stays flat.
+    PrintMan::DisplacementField push;
+    push.eval          = [](const PrintMan::V3 &, const PrintMan::V3 &) { return 2.0; };
+    push.max_magnitude = 2.0;
+    const int lifted_top = top_nonempty({push, PrintMan::DisplacementField{}});
+
+    INFO("base_top z=" << zs[base_top] << "  lifted_top z=" << zs[lifted_top]);
+    CHECK(lifted_top > base_top);                   // the tagged region rose above the plain cube
+    CHECK(zs[lifted_top] - zs[base_top] > 1.0f);    // by ~ the pushed magnitude, not a rounding wobble
+}
+
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
 // cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +

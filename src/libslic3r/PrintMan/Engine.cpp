@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -99,6 +100,9 @@ struct CageProto {
     std::vector<std::vector<int>> ring_vids;  // face -> its 1-ring control vertices (limit-patch support)
     std::string                   scheme;     // catmullClark (only scheme the band path refines)
     bool                          flip_winding = false;
+    // Per control face, the material that paints + displaces it (0 = the scene's default material, k>=1 =
+    // scene.extra_materials[k-1]); the core's per-control-face material tag (ctag). Empty = single material.
+    std::vector<int>              face_material;
     // device_level inputs: longest control edge (local) and largest crease sharpness; sigma per placement.
     double                        max_edge = 0.0;
     double                        max_crease = 0.0;
@@ -133,6 +137,7 @@ static std::vector<std::optional<CageProto>> build_cage_protos(const PrintManSce
         }
         cp.scheme            = sc.scheme;
         cp.flip_winding      = sc.flip_winding;
+        cp.face_material     = sc.face_material;   // per-control-face material tag (ctag); empty = single material
         cp.max_edge          = usd_subdiv::max_control_edge(cp.cage);
         cp.max_crease        = usd_subdiv::max_crease_sharpness(cp.cage);
         out[i]               = std::move(cp);
@@ -373,7 +378,8 @@ static void slice_cage_placement(const CageProto &cp,
                                  const std::function<void()> &on_band,
                                  const DisplacementField &displacement,
                                  const ColorField &color,
-                                 std::vector<std::vector<Polygons>> *bands_local)
+                                 std::vector<std::vector<Polygons>> *bands_local,
+                                 const std::vector<DisplacementField> &extra_displacements)
 {
     const usd_subdiv::Cage &cage = cp.cage;
     assert(cp.scheme == "catmullClark");   // build_cage_protos engages a CageProto only for CC cages
@@ -410,7 +416,8 @@ static void slice_cage_placement(const CageProto &cp,
     //     the normals agree; a low-amplitude field (max_disp < layer height) can step quietly at
     //     a band boundary. The fix -- band-invariant (halo-consistent / analytic-limit) normals --
     //     is a follow-up; until then displacement is only sound for max_disp >~ the layer height.
-    const double max_disp = displacement ? displacement.max_magnitude : 0.0;
+    // Each material's band face selection is grown by its own declared reach inside the core (over every
+    // shader in core_shaders), so a low-reach material never drops another material's relief.
 
     // Band thickness ~ the widest 1-ring Z-span (in layers), clamped: a face then falls in ~one band,
     // not every band its 1-ring touches -- a memory-for-refine trade.
@@ -424,11 +431,26 @@ static void slice_cage_placement(const CageProto &cp,
     // Fold: dice + displace through the vendored standalone engine (adaptive per-face, crack-free, any
     // cage) instead of the fork's uniform refine_region + apply_displacement. The world-space core cage
     // is built once (m baked in; winding reversed for the cage's authored flip XOR a det<0 mirror, so
-    // the winding-derived normals stay outward); a BridgeShader forwards the DisplacementField.
-    const bool                                  net_reverse = cp.flip_winding != flip_det;
-    const printman::subdiv::Cage                core_cage   = to_world_core_cage(cage, m, net_reverse);
-    BridgeShader                                bridge(&displacement, max_disp);
-    const std::vector<const printman::Shader *> core_shaders{&bridge};
+    // the winding-derived normals stay outward). One BridgeShader per material forwards its DisplacementField;
+    // ctag (cp.face_material) picks a face's material, and the core applies that material's shader per face.
+    // BridgeShader holds an atomic, so it is neither copyable nor movable -- a deque keeps N of them at stable
+    // addresses (no relocation) so core_shaders can point into it. Empty extras / ctag -> the single-shader path.
+    // Limitation: the core welds each material's mesh part separately, so a control vertex on a material seam
+    // is displaced independently by each side. Within a region the surface is crack-free; across a seam where
+    // two materials' displacements disagree by more than the slicer's contour-heal chord, the step is unwalled
+    // and a crossing slice can drop the seam contour. Acceptable for v1 (a seam is a deliberate region edge);
+    // a connecting wall / cross-material blend at boundaries is the follow-up.
+    const bool                   net_reverse = cp.flip_winding != flip_det;
+    const printman::subdiv::Cage core_cage   = to_world_core_cage(cage, m, net_reverse);
+    std::deque<BridgeShader>     bridges;
+    std::vector<const printman::Shader *> core_shaders;
+    bridges.emplace_back(&displacement, displacement.max_magnitude);
+    core_shaders.push_back(&bridges.back());
+    for (const DisplacementField &d : extra_displacements) {
+        bridges.emplace_back(&d, d.max_magnitude);
+        core_shaders.push_back(&bridges.back());
+    }
+    const std::vector<int> &ctag = cp.face_material;   // per-control-face material index (empty -> all 0)
 
     // Slice one band: the core dices + displaces this band's faces (for its own layer subset), then the
     // host colours + slices the returned mesh. Bands are independent: each writes only its own (disjoint)
@@ -459,7 +481,7 @@ static void slice_cage_placement(const CageProto &cp,
             accumulate_sections(out_local, first, sub);
             throw_on_cancel();
         };
-        printman::amplify_subcage_adaptive(core_cage, /*ctag*/ {}, core_shaders, level, params.subdiv_tol,
+        printman::amplify_subcage_adaptive(core_cage, ctag, core_shaders, level, params.subdiv_tol,
                                            band_zs_d, /*nbands*/ 1, on_core_band, /*do_slice*/ false);
         if (on_band) on_band();   // one band done -- advance the status bar (see slice_scene)
     };
@@ -476,15 +498,17 @@ static void slice_cage_placement(const CageProto &cp,
             });
     });
 
-    // The band's face selection was grown by the declared max_disp; if the shader actually moved a vertex
-    // farther, relief past the grown band can be clipped by Orca's fixed layer set. Warn so the user raises
-    // printman:maxMagnitude (restores the over-bound check the pre-fold apply_displacement path had).
-    const double peak = bridge.peak.load(std::memory_order_relaxed);
-    if (max_disp > 0.0 && peak > max_disp + 1e-6)
-        BOOST_LOG_TRIVIAL(warning)
-            << "PrintMan: displacement reached " << peak << " mm, past the declared maxMagnitude "
-            << max_disp << " mm; relief beyond the grown slice band may be clipped -- raise"
-               " printman:maxMagnitude.";
+    // Each material's band face selection was grown by its declared reach; if a shader actually moved a
+    // vertex farther, relief past the grown band can be clipped by Orca's fixed layer set. Warn per material
+    // so the user raises that printman:maxMagnitude (restores the over-bound check the pre-fold path had).
+    for (const BridgeShader &b : bridges) {
+        const double peak = b.peak.load(std::memory_order_relaxed);
+        if (b.reach > 0.0 && peak > b.reach + 1e-6)
+            BOOST_LOG_TRIVIAL(warning)
+                << "PrintMan: displacement reached " << peak << " mm, past the declared maxMagnitude "
+                << b.reach << " mm; relief beyond the grown slice band may be clipped -- raise"
+                   " printman:maxMagnitude.";
+    }
 }
 
 std::vector<ExPolygons> slice_scene(
@@ -495,7 +519,8 @@ std::vector<ExPolygons> slice_scene(
     const std::function<void(size_t, size_t)> &report_progress,
     const DisplacementField     &displacement,
     const ColorField            &color,
-    std::vector<std::vector<ExPolygons>> *out_segmentation)
+    std::vector<std::vector<ExPolygons>> *out_segmentation,
+    const std::vector<DisplacementField> &extra_displacements)
 {
     // Slice placements in parallel into thread-local per-layer buckets, merged at the end. Union is
     // associative and idempotent, so the result matches serial order.
@@ -555,7 +580,7 @@ std::vector<ExPolygons> slice_scene(
                 const Placement &place = scene.placements[pi];
                 const int        proto = place.prototype;
                 if (proto >= 0 && size_t(proto) < cageprotos.size() && cageprotos[proto])
-                    slice_cage_placement(*cageprotos[proto], params, zs, place, throw_on_cancel, out_local, bump, displacement, color, bl);
+                    slice_cage_placement(*cageprotos[proto], params, zs, place, throw_on_cancel, out_local, bump, displacement, color, bl, extra_displacements);
                 else {
                     slice_placement(protos, params, zs, place, throw_on_cancel, out_local);
                     bump();

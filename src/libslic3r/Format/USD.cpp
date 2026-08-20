@@ -1250,7 +1250,11 @@ ModelVolume *add_scene_volume(Model *model, ModelObject *object, const std::stri
     if (std::getenv("PRINTMAN_DEBUG_COLOR"))
         scene.filaments = {1, 2};
     // If this model bundles its shaders/maps (a self-contained .usdz), slice against the extracted copy.
-    if (! scene.osl_surface_shader.empty() || ! scene.osl_displacement_shader.empty())
+    // Any material -- the mesh's own or a region's -- naming a shader means the bundle may carry assets.
+    bool wants_shaders = ! scene.osl_surface_shader.empty() || ! scene.osl_displacement_shader.empty();
+    for (const PrintMan::MaterialShaders &mat : scene.extra_materials)
+        wants_shaders = wants_shaders || ! mat.surface.empty() || ! mat.displacement.empty();
+    if (wants_shaders)
         scene.osl_shader_searchpath = extract_usdz_shader_assets(path);
     volume->printman_scene = std::move(scene);
     return volume;
