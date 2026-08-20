@@ -2024,6 +2024,76 @@ TEST_CASE("A mesh with no subsets keeps an empty per-face tag", "[usd][printman]
     CHECK(nonempty > 10);
 }
 
+// An instanced stage of ONE shaded prototype must import shaded (its material carried onto the scene) AND
+// displace each instance in world space -- the shape of Karl's grass-in-wind case: author one blade + one
+// wind shader, place it many times. Two blade instances sit 100mm apart in X; a displacement field that grows
+// with world X pushes the far instance much more than the near one, so two instances from a SINGLE prototype
+// and a SINGLE shader end up different heights. That is per-placement world-space displacement -- the thing
+// that makes a non-uniform field (wind) vary across a lawn. No OSL: a C++ field stands in for the wind shader.
+TEST_CASE("An instanced shaded prototype carries its shader and displaces per placement", "[usd][printman][subdiv][instancing]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("instanced_shaded_blades.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    const PrintMan::PrintManScene &scene = *vol->printman_scene;
+
+    // Import side: the prototype's material rode onto the scene (without this the instances print bare).
+    CHECK(scene.placements.size() == 2);
+    CHECK(scene.prototypes.size() == 1);
+    CHECK(scene.cages.size()      == 1);
+    CHECK(scene.osl_displacement_shader == "printman_test_disp");
+    CHECK(scene.osl_max_displacement    == Catch::Approx(3.0));
+    CHECK(scene.osl_surface_shader      == "printman_gradient");
+
+    // Slice envelope from the proxy AABB, with headroom above for the pushed geometry.
+    const Transform3d m = vol->get_matrix();
+    float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+    for (const Vec3f &v : vol->mesh().its.vertices) {
+        const float z = float((m * v.cast<double>()).z());
+        zmin = std::min(zmin, z); zmax = std::max(zmax, z);
+    }
+    std::vector<float> zs;
+    for (float z = zmin + 0.1f; z < zmax + 10.0f; z += 0.5f) zs.push_back(z);
+    REQUIRE(zs.size() > 10);
+    MeshSlicingParamsEx params; params.trafo = m; params.subdiv_tol = 0.05;
+
+    // Non-uniform "wind": displacement grows with world X (capped), so the far instance rises far more.
+    PrintMan::DisplacementField wind;
+    wind.eval          = [](const PrintMan::V3 &p, const PrintMan::V3 &) {
+        return std::min(8.0, 1.0 + 0.08 * std::max(0.0, p[0]));
+    };
+    wind.max_magnitude = 8.0;
+    const std::vector<ExPolygons> layers = PrintMan::slice_scene(
+        scene, params, zs, [](){}, {}, wind, PrintMan::ColorField{}, nullptr, {});
+    REQUIRE(layers.size() == zs.size());
+
+    // Separate the two instances by contour X without assuming absolute coordinates: the blades are ~100mm
+    // apart, so the min/max contour-X midpoint cleanly cuts near (smaller X) from far (larger X).
+    double xlo = std::numeric_limits<double>::infinity(), xhi = -xlo;
+    for (const ExPolygons &layer : layers)
+        for (const ExPolygon &ex : layer) {
+            const double cx = unscale<double>(ex.contour.bounding_box().center().x());
+            xlo = std::min(xlo, cx); xhi = std::max(xhi, cx);
+        }
+    REQUIRE(std::isfinite(xlo));
+    REQUIRE(xhi - xlo > 50.0);          // two clusters ~100mm apart, not one blob
+    const double xmid = 0.5 * (xlo + xhi);
+
+    int near_top = -1, far_top = -1;
+    for (int i = 0; i < int(layers.size()); ++ i)
+        for (const ExPolygon &ex : layers[i]) {
+            const double cx = unscale<double>(ex.contour.bounding_box().center().x());
+            if (cx < xmid) near_top = std::max(near_top, i);
+            else           far_top  = std::max(far_top,  i);
+        }
+    INFO("near_top z=" << (near_top >= 0 ? zs[near_top] : -1.f)
+         << "  far_top z=" << (far_top >= 0 ? zs[far_top] : -1.f));
+    REQUIRE(near_top >= 0);
+    REQUIRE(far_top  >= 0);
+    CHECK(far_top > near_top + 4);      // the far instance rose well above the near one -- per-placement wind
+}
+
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
 // cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +

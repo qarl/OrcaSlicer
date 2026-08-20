@@ -1,0 +1,67 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# An instanced stage whose ONE subdivision-cage prototype binds a displacement material -- the shape of Karl's
+# grass-in-wind case: author one blade + one wind shader, place it many times. The importer must carry the
+# prototype's shader onto the instancing scene (else the instances print bare), and the slicer displaces each
+# placement in WORLD space, so a non-uniform field bends each instance to its own position. Two instances, one
+# at world X=0 and one at world X=100, so a test can push only the far one and see just it rise.
+def "Prototypes"
+{
+    class Xform "Proto"
+    {
+        def Mesh "Blade" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7]
+            point3f[] points = [(0, 0, 0), (30, 0, 0), (30, 30, 0), (0, 30, 0), (0, 0, 30), (30, 0, 30), (30, 30, 30), (0, 30, 30)]
+            uniform token subdivisionScheme = "catmullClark"
+            rel material:binding = </Prototypes/Proto/Blade/Wind>
+
+            def Material "Wind"
+            {
+                token outputs:surface.connect = </Prototypes/Proto/Blade/Wind/Surface.outputs:out>
+                token outputs:displacement.connect = </Prototypes/Proto/Blade/Wind/Disp.outputs:out>
+
+                def Shader "Surface"
+                {
+                    uniform token info:id = "printman_gradient"
+                    token outputs:out
+                }
+
+                def Shader "Disp"
+                {
+                    uniform token info:id = "printman_test_disp"
+                    float inputs:printman:maxMagnitude = 3.0
+                    token outputs:out
+                }
+            }
+        }
+    }
+}
+
+def "Root"
+{
+    def Xform "blade_000" (
+        prepend inherits = </Prototypes/Proto>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "blade_001" (
+        prepend inherits = </Prototypes/Proto>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (100, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

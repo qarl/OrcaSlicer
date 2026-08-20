@@ -1077,6 +1077,7 @@ void build_instance_scene(const UsdStageRefPtr &stage, UsdTimeCode when,
 {
     std::map<std::string, int> proto_index;
     UsdGeomXformCache xf(when);
+    bool shading_set = false;   // one material set per scene: the first prototype to bind a material wins
     UsdPrimRange range = UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies());
     for (const UsdPrim &prim : range) {
         if (!prim.IsInstanceProxy())
@@ -1097,7 +1098,29 @@ void build_instance_scene(const UsdStageRefPtr &stage, UsdTimeCode when,
             // A cage prototype is deferred like a standalone cage, refined per placement rather than
             // imported unrefined; the pushed prototype stays the control mesh (the arrangement proxy).
             PrintMan::SubdivCage sc;
-            if (read_prototype_cage(mesh, when, usd_subdiv::kDeviceLevelMax, sc))
+            const bool is_cage = read_prototype_cage(mesh, when, usd_subdiv::kDeviceLevelMax, sc);
+            // Carry the prototype's material so an instanced shaded stage prints shaded, not bare. The
+            // scene's shader fields are ONE set applied to every cage placement; the same displacement field
+            // is evaluated per placement in WORLD space (to_world_core_cage bakes each instance's transform),
+            // so a non-uniform field -- e.g. wind on a lawn of one blade prototype -- bends each instance
+            // to its own world position. Limitation (one material set per scene): the first prototype to bind
+            // a material wins, and EVERY cage placement is then displaced/coloured by that one material --
+            // including a second cage prototype that has no material of its own. Distinct per-prototype
+            // shading needs per-prototype carriage (see PRINTMAN-RESUME 'shaders on instances'); until then a
+            // stage of more than one cage prototype is warned below, not silently mixed.
+            // The prototype's whole-surface material only; per-region face subsets on an instanced prototype
+            // are a separate follow-up (single-material per prototype covers the grass-in-wind case).
+            const PrintMan::MaterialShaders pm = read_printman_material(mesh.GetPrim(), when);
+            if ((! pm.surface.empty() || ! pm.displacement.empty()) && ! shading_set) {
+                scene.osl_surface_shader      = pm.surface;
+                scene.osl_displacement_shader = pm.displacement;
+                scene.osl_max_displacement    = pm.max_displacement;
+                scene.color_object_space      = pm.object_space;
+                scene.color_dither            = pm.dither;
+                scene.color_all_filaments     = pm.all_filaments;
+                shading_set = true;
+            }
+            if (is_cage)
                 scene.cages.emplace(idx, std::move(sc));
         } else {
             idx = found->second;
@@ -1107,6 +1130,13 @@ void build_instance_scene(const UsdStageRefPtr &stage, UsdTimeCode when,
         place.xform     = root * gf_to_transform(xf.GetLocalToWorldTransform(prim));
         scene.placements.push_back(place);
     }
+    // One material set per scene: if a material was carried, it is applied to every cage placement -- so more
+    // than one cage prototype means the others inherit it (their own material, if any, is dropped). Warn once;
+    // this is the documented ceiling until per-prototype shader carriage lands.
+    if (shading_set && scene.cages.size() > 1)
+        BOOST_LOG_TRIVIAL(warning) << "PrintMan: instanced stage has " << scene.cages.size()
+            << " subdivision-cage prototypes but one material set; every cage placement slices with the first "
+               "shaded prototype's material and displacement (one material set per scene).";
 }
 
 // Reopen the stage (read_stage already validated it) to extract instancing as a scene.
