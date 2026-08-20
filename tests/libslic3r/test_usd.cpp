@@ -2851,4 +2851,44 @@ TEST_CASE("The grid shader rides bundled in a .usdz onto sphere instances", "[us
     CHECK(a_grid > a_plain);                              // the raised lattice grows the spheres outward
     CHECK(std::abs(a_grid - a_plain) > 0.002 * a_plain);  // by a measurable amount, not slice noise
 }
+
+// The same bundled grid .usdz through Orca's FULL pipeline (print.process(), the GUI path), not just the
+// engine's slice_scene: the OSL displacement field is built from the extracted bundle searchpath inside
+// PrintObjectSlice -- the wiring the engine-level test above hand-builds and so skips. Proves an instanced
+// stage with a bundled OSL shader slices end to end into both islands, so a GUI open of this file will not
+// choke on the shader path.
+SCENARIO_METHOD(UsdResourcesFixture, "The bundled grid spheres slice through Orca's pipeline", "[usd][printman][osl][usdz][instancing]")
+{
+    GIVEN("the instanced grid-sphere .usdz imported with amplification") {
+        Model model; std::string message;
+        REQUIRE(load_usd(usd_path("instanced_grid_spheres.usdz").c_str(), &model, message, nullptr, true));
+        ModelVolume *vol = model.objects.front()->volumes.front();
+        REQUIRE(vol->printman_scene.has_value());
+        REQUIRE(vol->printman_scene->placements.size() == 2);
+
+        // Minimal print setup, mirroring the instanced-cubes pipeline test above.
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        ModelObject *mo = model.objects.front();
+        mo->add_instance();
+        arrange_objects(model, arrangement::InfiniteBed{}, arrangement::ArrangeParams{ scaled(min_object_distance(config)) });
+        mo->ensure_on_bed();
+        Print print;
+        print.auto_assign_extruders(mo);
+        print.apply(model, config);
+        print.validate();
+
+        THEN("Orca's own pipeline slices both grid spheres, displaced by the bundled shader") {
+            std::string err;
+            try { print.process(); }
+            catch (const SlicingErrors &e) { for (const auto &se : e.errors_) err += std::string("[") + se.what() + "]"; }
+            catch (const SlicingError  &e) { err = e.what(); }
+            catch (const std::exception &e) { err = e.what(); }
+            INFO("process errors: " << err);
+            REQUIRE(err.empty());
+            const auto layers = print.objects().front()->layers();
+            REQUIRE(layers.size() > 0);
+            REQUIRE(layers[layers.size() / 2]->lslices.size() == 2);   // the two sphere instances
+        }
+    }
+}
 #endif // SLIC3R_OSL
