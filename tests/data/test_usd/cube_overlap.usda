@@ -1,0 +1,74 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# Two face subsets list the SAME face (index 1, the top) but bind different materials. UsdGeomSubset does not
+# forbid this, so the importer must resolve it deterministically. The contract is last-wins in the order
+# UsdGeomSubset::GetAllGeomSubsets returns: whichever subset the importer visits last owns the face. The test
+# asserts the resolved tag is one of the two bound materials and is stable across reloads (not that a specific
+# one wins, since the visit order is USD's to define). Faces: 0 bottom, 1 top, 2-5 sides.
+def Mesh "cube" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-5, -5, 0), (5, -5, 0), (5, 5, 0), (-5, 5, 0), (-5, -5, 10), (5, -5, 10), (5, 5, 10), (-5, 5, 10)]
+    uniform token subdivisionScheme = "catmullClark"
+    rel material:binding = </cube/MatBase>
+
+    def GeomSubset "first" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [1]
+        rel material:binding = </cube/MatFirst>
+    }
+
+    def GeomSubset "second" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [1]
+        rel material:binding = </cube/MatSecond>
+    }
+
+    def Material "MatBase"
+    {
+        token outputs:surface.connect = </cube/MatBase/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_gradient"
+            token outputs:out
+        }
+    }
+
+    def Material "MatFirst"
+    {
+        token outputs:surface.connect = </cube/MatFirst/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_uv"
+            token outputs:out
+        }
+    }
+
+    def Material "MatSecond"
+    {
+        token outputs:surface.connect = </cube/MatSecond/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_spectrum"
+            token outputs:out
+        }
+    }
+}

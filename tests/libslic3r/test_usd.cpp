@@ -1856,6 +1856,174 @@ TEST_CASE("Per-region displacement lifts only the tagged material's faces", "[us
     CHECK(zs[lifted_top] - zs[base_top] > 1.0f);    // by ~ the pushed magnitude, not a rounding wobble
 }
 
+// Past two subsets: three face subsets bind three distinct materials, so the mesh becomes four regions (the
+// mesh's own material 0 plus three overrides). This locks the read past the two-subset case AND the per-slot
+// displacement routing: a displacement field pushed into the top face's OWN material slot lifts the top,
+// while the same push into a SIDE face's slot leaves the top untouched. That the lift follows the slot -- not
+// a fixed slot 0 -- is the alignment guarantee (material tag k -> extra_displacements[k-1]) for slots past the
+// first. Content-addressed, so it does not depend on the order GetAllGeomSubsets returns the subsets.
+TEST_CASE("Three face subsets become four regions with per-slot displacement routing", "[usd][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_three_materials.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    const PrintMan::PrintManScene &scene = *vol->printman_scene;
+    REQUIRE(scene.extra_materials.size() == 3);
+    REQUIRE(scene.cages.size() == 1);
+    const PrintMan::SubdivCage &cage = scene.cages.begin()->second;
+    REQUIRE(cage.face_material.size() == 6);
+
+    auto surface_of = [&](int f) -> std::string {
+        const int mi = cage.face_material.at(f);
+        return mi == 0 ? scene.osl_surface_shader : scene.extra_materials.at(mi - 1).surface;
+    };
+    // Top face (1) -> relief; two side faces (3, 5) -> their own materials; the rest keep material 0.
+    CHECK(surface_of(1) == "printman_spectrum");
+    CHECK(scene.extra_materials.at(cage.face_material[1] - 1).displacement == "printman_test_disp");
+    CHECK(surface_of(3) == "printman_uv");
+    CHECK(surface_of(5) == "printman_grid");
+    for (const int f : {0, 2, 4}) { INFO("face " << f); CHECK(cage.face_material[f] == 0); }
+
+    const Transform3d m = vol->get_matrix();
+    float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+    for (const Vec3f &v : vol->mesh().its.vertices) {
+        const float z = float((m * v.cast<double>()).z());
+        zmin = std::min(zmin, z); zmax = std::max(zmax, z);
+    }
+    std::vector<float> zs;
+    for (float z = zmin + 0.1f; z < zmax + 3.0f; z += 0.2f) zs.push_back(z);
+    REQUIRE(zs.size() > 10);
+    MeshSlicingParamsEx params; params.trafo = m; params.subdiv_tol = 0.05;
+
+    auto top_nonempty = [&](const std::vector<PrintMan::DisplacementField> &extra) {
+        const std::vector<ExPolygons> layers = PrintMan::slice_scene(
+            scene, params, zs, [](){}, {}, PrintMan::DisplacementField{}, PrintMan::ColorField{}, nullptr, extra);
+        int top = -1;
+        for (int i = 0; i < int(layers.size()); ++ i) if (! layers[i].empty()) top = i;
+        return top;
+    };
+    // Push +2 mm into exactly one material slot, every other region flat.
+    auto only_slot = [&](int slot) {
+        std::vector<PrintMan::DisplacementField> extra(scene.extra_materials.size());
+        extra.at(slot).eval          = [](const PrintMan::V3 &, const PrintMan::V3 &) { return 2.0; };
+        extra.at(slot).max_magnitude = 2.0;
+        return extra;
+    };
+
+    const int base_top = top_nonempty({});
+    REQUIRE(base_top >= 0);
+    const int top_tag  = cage.face_material[1];   // the top face's material slot (1..N)
+    const int side_tag = cage.face_material[3];   // a side face's material slot
+    REQUIRE(top_tag  >= 1);
+    REQUIRE(side_tag >= 1);
+    REQUIRE(side_tag != top_tag);                 // distinct slots, so this exercises routing past slot 0
+
+    // Pushing the top's OWN slot lifts the top by ~2 mm (ten 0.2 mm layers). Pushing a side's slot barely
+    // moves it -- only the tiny +Z bleed of the rounded cage's near-top edge normals, a layer or two, never
+    // the full push. A misrouted slot (the side field wrongly applied to the top region) would lift the top
+    // the full 2 mm from the side slot, so the top's slot dominating any other slot is the alignment proof.
+    const int top_lift  = top_nonempty(only_slot(top_tag  - 1)) - base_top;
+    const int side_lift = top_nonempty(only_slot(side_tag - 1)) - base_top;
+    INFO("top_lift=" << top_lift << " layers  side_lift=" << side_lift << " layers");
+    CHECK(top_lift >  5);                          // the top's own slot lifts it by most of the 2 mm push
+    CHECK(top_lift >  side_lift + 3);              // and dominates any other slot -- routing is per material
+}
+
+// Two subsets claim the same face with different materials. UsdGeomSubset permits this, so the importer must
+// resolve it deterministically. The contract is last-wins in GetAllGeomSubsets order: the top face resolves
+// to one of the two bound materials, and that resolution is stable across reloads. Both materials are still
+// recorded (the overwritten one stays in the list, unreferenced but harmless -- never selected because no
+// face carries its tag); pruning it would mean renumbering, which last-wins does not require.
+TEST_CASE("Overlapping face subsets resolve last-wins and deterministically", "[usd][printman][subdiv]")
+{
+    auto top_material_surface = [&]() -> std::string {
+        Model model; std::string message;
+        REQUIRE(load_usd(usd_path("cube_overlap.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+        const PrintMan::PrintManScene &sc = *model.objects.front()->volumes.front()->printman_scene;
+        REQUIRE(sc.extra_materials.size() == 2);           // both bindings recorded
+        const PrintMan::SubdivCage &cage = sc.cages.begin()->second;
+        REQUIRE(cage.face_material.size() == 6);
+        const int mi = cage.face_material[1];
+        REQUIRE(mi >= 1);
+        return sc.extra_materials.at(mi - 1).surface;
+    };
+    const std::string first = top_material_surface();
+    // One of the two overlapping materials owns the face -- not the base material, not a blend.
+    CHECK((first == "printman_uv" || first == "printman_spectrum"));
+    // Reloading resolves the face identically: the winner is a function of the file, not of run order.
+    CHECK(top_material_surface() == first);
+}
+
+// Degenerate subsets must neither corrupt the per-face tag nor add phantom region materials. cube_degenerate
+// has four subsets of which only one paints a real face: "empty" (no indices) and the out-of-range indices of
+// "oob" paint nothing, "nobind" carries no material, and "rebind" re-binds the mesh's own material (folds to
+// 0). The one real override is face 0 -> MatOob. So exactly one region material is recorded, every recorded
+// material is referenced by a face, and the tag array stays the control-face count. (The == 1 count is the
+// guard against a skipped subset still recording its material: an empty/all-out-of-range subset must be
+// dropped whole, before its material is added, or a would-be single-material cage flips onto the merge path.)
+TEST_CASE("Degenerate face subsets add no phantom material and corrupt no tag", "[usd][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_degenerate.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    const PrintMan::PrintManScene &sc = *model.objects.front()->volumes.front()->printman_scene;
+    const PrintMan::SubdivCage &cage = sc.cages.begin()->second;
+
+    REQUIRE(cage.face_material.size() == 6);          // tag array stays the control-face count
+    REQUIRE(sc.extra_materials.size() == 1);          // only MatOob; empty/nobind/rebind add nothing
+    CHECK(sc.extra_materials[0].surface == "printman_spectrum");
+
+    // Only face 0 (the lone in-range index of "oob") is overridden; every other face stays material 0.
+    CHECK(cage.face_material[0] == 1);
+    for (const int f : {1, 2, 3, 4, 5}) { INFO("face " << f); CHECK(cage.face_material[f] == 0); }
+
+    // No phantom: every recorded region material is carried by at least one face.
+    for (int mi = 1; mi <= int(sc.extra_materials.size()); ++ mi) {
+        INFO("material " << mi);
+        CHECK(std::count(cage.face_material.begin(), cage.face_material.end(), mi) > 0);
+    }
+}
+
+// The headline case for the skip-a-subset-that-paints-no-face guard: a mesh that HAS a face subset, but the
+// subset paints nothing (empty indices). The per-face tag must stay EMPTY -- the guard skips the subset before
+// allocating the tag, so the cage keeps the single-material path (M == 1). Without the guard the subset would
+// allocate an all-zeros tag and record its unused material, flipping this single-material cage onto the
+// multi-material merge path. This is distinct from the no-subset case (which returns before the loop) and from
+// cube_degenerate (which has one real paint, so a legitimately non-empty tag).
+TEST_CASE("A subset that paints no face leaves the per-face tag empty", "[usd][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_only_degenerate.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    const PrintMan::PrintManScene &sc = *model.objects.front()->volumes.front()->printman_scene;
+    REQUIRE(sc.cages.size() == 1);
+    CHECK(sc.cages.begin()->second.face_material.empty());   // empty tag, NOT an all-zeros vector
+    CHECK(sc.extra_materials.empty());                       // the unused material is not recorded
+}
+
+// A mesh with NO face subsets must stay on the single-material path: the cage's per-face tag is empty and no
+// region materials are recorded, so the core sees an empty ctag (M == 1) and slices the plain merged mesh --
+// byte-identical to the pre-multi-material importer. Locking the empty tag catches any future change to the
+// subset read that would populate face_material (and thus perturb a single-material slice) on a plain mesh.
+TEST_CASE("A mesh with no subsets keeps an empty per-face tag", "[usd][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    const PrintMan::PrintManScene &scene = *model.objects.front()->volumes.front()->printman_scene;
+    REQUIRE(scene.extra_materials.empty());           // no region materials
+    REQUIRE(scene.cages.size() == 1);
+    CHECK(scene.cages.begin()->second.face_material.empty());   // empty tag -> ctag {} -> M == 1
+
+    // And it still slices: an empty tag drives the plain single-material path, not a degenerate empty result.
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    const Transform3d m = vol->get_matrix();
+    std::vector<float> zs; for (float z = 0.5f; z < 9.5f; z += 0.5f) zs.push_back(z);
+    MeshSlicingParamsEx params; params.trafo = m; params.subdiv_tol = 0.05;
+    const std::vector<ExPolygons> layers = PrintMan::slice_scene(scene, params, zs, [](){});
+    REQUIRE(layers.size() == zs.size());
+    int nonempty = 0; for (const ExPolygons &l : layers) if (! l.empty()) ++ nonempty;
+    CHECK(nonempty > 10);
+}
+
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
 // cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +

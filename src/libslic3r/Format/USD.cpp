@@ -468,6 +468,16 @@ static void read_face_subset_materials(const UsdGeomMesh &mesh, UsdTimeCode when
         const UsdShadeMaterial sm = UsdShadeMaterialBindingAPI(subset.GetPrim()).ComputeBoundMaterial();
         if (! sm)
             continue;   // a subset with no material binding repaints nothing
+        // A subset that paints no in-range face (empty indices, or all out of range) is skipped whole,
+        // before its material is recorded -- so it adds no phantom region material and cannot flip a cage
+        // that should stay single-material onto the multi-material merge path.
+        VtIntArray idx;
+        subset.GetIndicesAttr().Get(&idx, when);
+        bool paints = false;
+        for (const int f : idx)
+            if (f >= 0 && f < nfaces) { paints = true; break; }
+        if (! paints)
+            continue;
         const std::string key = sm.GetPath().GetString();
         int mi;
         if (const auto it = mat_index.find(key); it != mat_index.end())
@@ -481,8 +491,6 @@ static void read_face_subset_materials(const UsdGeomMesh &mesh, UsdTimeCode when
             continue;   // this subset re-binds the mesh's own material: no per-face override needed
         if (fm.empty())
             fm.assign(nfaces, 0);
-        VtIntArray idx;
-        subset.GetIndicesAttr().Get(&idx, when);
         for (const int f : idx)
             if (f >= 0 && f < nfaces)
                 fm[f] = mi;

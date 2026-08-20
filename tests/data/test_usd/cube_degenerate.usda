@@ -1,0 +1,92 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# Degenerate face subsets that must not corrupt the per-face tag or add phantom region materials:
+#   "empty"  -- empty indices, binds a distinct material: paints no face, so it must add no region material.
+#   "nobind" -- names a face but carries no material binding: repaints nothing (stays material 0).
+#   "rebind" -- binds the MESH's own material (MatBase): folds back to material 0, no override.
+#   "oob"    -- indices [99, -1, 0]: the out-of-range ones are dropped, the in-range one (face 0) is tagged.
+# The only real override is face 0 -> MatOob. Faces: 0 bottom, 1 top, 2-5 sides.
+def Mesh "cube" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-5, -5, 0), (5, -5, 0), (5, 5, 0), (-5, 5, 0), (-5, -5, 10), (5, -5, 10), (5, 5, 10), (-5, 5, 10)]
+    uniform token subdivisionScheme = "catmullClark"
+    rel material:binding = </cube/MatBase>
+
+    def GeomSubset "empty" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = []
+        rel material:binding = </cube/MatEmpty>
+    }
+
+    def GeomSubset "nobind"
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [2]
+    }
+
+    def GeomSubset "rebind" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [4]
+        rel material:binding = </cube/MatBase>
+    }
+
+    def GeomSubset "oob" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [99, -1, 0]
+        rel material:binding = </cube/MatOob>
+    }
+
+    def Material "MatBase"
+    {
+        token outputs:surface.connect = </cube/MatBase/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_gradient"
+            token outputs:out
+        }
+    }
+
+    def Material "MatEmpty"
+    {
+        token outputs:surface.connect = </cube/MatEmpty/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_uv"
+            token outputs:out
+        }
+    }
+
+    def Material "MatOob"
+    {
+        token outputs:surface.connect = </cube/MatOob/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_spectrum"
+            token outputs:out
+        }
+    }
+}

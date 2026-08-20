@@ -1,0 +1,52 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# A cube whose ONLY face subset paints nothing: "empty" binds a distinct material but lists no faces. This is
+# the headline case for the skip-a-subset-that-paints-no-face guard -- with subsets present but none painting
+# an in-range face, the per-face tag must stay EMPTY (the single-material path), not become an all-zeros vector
+# (which would flip the cage onto the multi-material merge path), and the unused material must not be recorded.
+def Mesh "cube" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-5, -5, 0), (5, -5, 0), (5, 5, 0), (-5, 5, 0), (-5, -5, 10), (5, -5, 10), (5, 5, 10), (-5, 5, 10)]
+    uniform token subdivisionScheme = "catmullClark"
+    rel material:binding = </cube/MatBase>
+
+    def GeomSubset "empty" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = []
+        rel material:binding = </cube/MatEmpty>
+    }
+
+    def Material "MatBase"
+    {
+        token outputs:surface.connect = </cube/MatBase/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_gradient"
+            token outputs:out
+        }
+    }
+
+    def Material "MatEmpty"
+    {
+        token outputs:surface.connect = </cube/MatEmpty/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_uv"
+            token outputs:out
+        }
+    }
+}
