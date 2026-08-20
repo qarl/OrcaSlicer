@@ -207,7 +207,11 @@ inline std::vector<LayerSegs> amplify_subcage_adaptive(subdiv::Cage cage, std::v
 
     // TEMPLATE: refine one parametric quad to `level`; tmpl[m*4+c] = lattice node index (j*(S+1)+i)
     // of leaf m's corner c. Every quad's leaf block shares this ordering, so the map is reusable.
-    std::vector<int> tmpl((size_t)S * S * 4);
+    // cell_anti[j*S+i] records how leaf m (the one filling grid cell (i,j)) fans: a CC child quad is
+    // triangulated from its corner 0 to corner 2, so the full-resolution grid splits each cell along
+    // that same diagonal and tessellates a curved patch exactly as the eager per-quad fan does.
+    std::vector<int>  tmpl((size_t)S * S * 4);
+    std::vector<char> cell_anti((size_t)S * S, 0);
     {
         subdiv::Cage tq;
         tq.verts = {{0,0,0},{1,0,0},{1,1,0},{0,1,0}}; tq.fvi = {0,1,2,3}; tq.foff = {0,4};
@@ -219,6 +223,14 @@ inline std::vector<LayerSegs> amplify_subcage_adaptive(subdiv::Cage cage, std::v
                 int i = (int)std::llround(tr.fvar[k][0] * S), j = (int)std::llround(tr.fvar[k][1] * S);
                 tmpl[(size_t)m * 4 + c] = j * (S + 1) + i;
             }
+        // corner 0 and corner 2 are diagonally opposite; the cell they share is (min i, min j). The
+        // main diagonal joins the two extreme corners (both-min .. both-max), so corner 0->2 is the
+        // ANTI diagonal exactly when one coordinate rises while the other falls between them.
+        for (int m = 0; m < S * S; ++m) {
+            int n0 = tmpl[(size_t)m * 4 + 0], n2 = tmpl[(size_t)m * 4 + 2];
+            int i0 = n0 % (S + 1), j0 = n0 / (S + 1), i2 = n2 % (S + 1), j2 = n2 / (S + 1);
+            cell_anti[(size_t)std::min(j0, j2) * S + std::min(i0, i2)] = ((i0 < i2) != (j0 < j2)) ? 1 : 0;
+        }
 #ifndef NDEBUG
         // The template must cover every (i,j) lattice node (surjective) -- otherwise latflat keeps a
         // stale/-1 entry and emit() reads a wrong vertex. Fails loudly if subdivide's child/corner
@@ -325,10 +337,18 @@ inline std::vector<LayerSegs> amplify_subcage_adaptive(subdiv::Cage cage, std::v
                 if (i == 0) t = snap(t, nt3); else if (i == Ns) t = snap(t, nt1);
                 idx[(size_t)j*(Ns+1)+i] = emit(s, t);
             }
+            // Split each quad along the leaf's own corner 0->2 diagonal (cell_anti), so a curved patch
+            // tessellates exactly as the eager per-quad fan -- a single fixed diagonal biases a dome and
+            // shifts the slice a couple percent. The full-resolution grid maps one cell to one leaf; a
+            // coarsened cell (Ns<S) spans several leaves, so it falls back to a centre-ward split, which
+            // keeps the face's symmetry without a leaf to match.
+            const bool full = (Ns == S && Nt == S);
             for (int j = 0; j < Nt; ++j) for (int i = 0; i < Ns; ++i) {
                 std::uint32_t v00 = idx[(size_t)j*(Ns+1)+i], v10 = idx[(size_t)j*(Ns+1)+i+1];
                 std::uint32_t v11 = idx[(size_t)(j+1)*(Ns+1)+i+1], v01 = idx[(size_t)(j+1)*(Ns+1)+i];
-                mm.tri.push_back({v00, v10, v11}); mm.tri.push_back({v00, v11, v01});
+                const bool anti = full ? cell_anti[(size_t)j*S+i] : (((2*i+1) < Ns) != ((2*j+1) < Nt));
+                if (!anti) { mm.tri.push_back({v00, v10, v11}); mm.tri.push_back({v00, v11, v01}); }
+                else       { mm.tri.push_back({v00, v10, v01}); mm.tri.push_back({v10, v11, v01}); }
             }
         }
         Mesh bm = (M == 1) ? std::move(parts[0]) : merge_meshes(parts);
