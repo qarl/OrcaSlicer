@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "printman/geom.hpp"   // V3 = std::array<double,3>
+#include "PrintMan/Core/geom.hpp"   // V3 = std::array<double,3>
 
 namespace printman {
 

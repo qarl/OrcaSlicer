@@ -9,8 +9,8 @@
 #include <array>
 #include <vector>
 
-#include "printman/geom.hpp"
-#include "printman/palette.hpp"
+#include "PrintMan/Core/geom.hpp"
+#include "PrintMan/Core/palette.hpp"
 
 namespace printman {
 

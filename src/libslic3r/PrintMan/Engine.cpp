@@ -23,6 +23,7 @@
 #include "libslic3r/TriangleMeshSlicer.hpp"  // slice_mesh_ex, MeshSlicingParamsEx
 #include "libslic3r/Format/USDSubdiv.hpp"    // build_cage, subdivide, refine_region, device_level
 #include "libslic3r/PrintMan/Palette.hpp"    // nearest_filament (colour quantization)
+#include "libslic3r/PrintMan/CoreAdapter.hpp" // vendored core: amplify_subcage_adaptive + host<->core converters
 
 namespace Slic3r { namespace PrintMan {
 
@@ -420,55 +421,35 @@ static void slice_cage_placement(const CageProto &cp,
     for (size_t first = 0; first < nlayers; first += band_layers)
         band_ranges.push_back({first, std::min(first + band_layers, nlayers)});
 
-    // Refine, bake and slice one band. Bands are independent: each writes only its own layer range of
-    // out_local (disjoint), and the cage/params reads are const, so they run in parallel.
+    // Fold: dice + displace through the vendored standalone engine (adaptive per-face, crack-free, any
+    // cage) instead of the fork's uniform refine_region + apply_displacement. The world-space core cage
+    // is built once (m baked in; winding reversed for the cage's authored flip XOR a det<0 mirror, so
+    // the winding-derived normals stay outward); a BridgeShader forwards the DisplacementField.
+    const bool                                  net_reverse = cp.flip_winding != flip_det;
+    const printman::subdiv::Cage                core_cage   = to_world_core_cage(cage, m, net_reverse);
+    BridgeShader                                bridge(&displacement, max_disp);
+    const std::vector<const printman::Shader *> core_shaders{&bridge};
+
+    // Slice one band: the core dices + displaces this band's faces (for its own layer subset), then the
+    // host colours + slices the returned mesh. Bands are independent: each writes only its own (disjoint)
+    // layer range of out_local, so they run in parallel.
     const auto slice_band = [&](size_t first, size_t last) {
-        const double zlo = zs[first], zhi = zs[last - 1];
+        std::vector<double> band_zs_d(zs.begin() + first, zs.begin() + last);   // this band's layers (ascending)
 
-        std::vector<int> core;
-        for (int f = 0; f < cage.nfaces(); ++ f)
-            if (bk.fhi[f] >= zlo - max_disp && bk.flo[f] <= zhi + max_disp)
-                core.push_back(f);
-        if (! core.empty()) {
-            usd_subdiv::Cage     region = usd_subdiv::refine_region(cage, cp.vf, core, level);
-            std::vector<std::array<float, 2>> tri_uv;   // per-triangle authored UV (empty if the cage has none)
-            // Colour AND a texture-driven displacement both need the authored UV; without it a height-map
-            // relief samples one constant texel per vertex (uniform inflation, not terrain).
-            const bool want_uv = (color && bands_local) || bool(displacement);
-            indexed_triangle_set its    = triangulate_cage(region, cp.flip_winding, want_uv ? &tri_uv : nullptr);
-            for (Vec3f &v : its.vertices)
-                v = (m * v.cast<double>()).cast<float>();
-            if (flip_det)
-                its_flip_triangles(its);
-            if (displacement) {   // move each refined vertex along its normal (world space)
-                // apply_displacement takes the footprint-aware form; a plain (point,normal) built-in
-                // is bridged by dropping the derivatives. The OSL path sets eval_d and gets them.
-                PrintMan::DisplaceShaderD shade;
-                if (displacement.eval_d)
-                    shade = displacement.eval_d;
-                else
-                    shade = [&displacement](const V3 &p, const V3 &n, const V3 &, const V3 &, double, double) { return displacement.eval(p, n); };
-                const double moved = apply_displacement(its, shade, tri_uv);   // tri_uv drives a height-map relief
-                // The field MUST stay within max_magnitude: the band's face selection was grown by
-                // exactly that (above), so a larger move means faces that displaced into this band
-                // were never selected and are silently missing from the slice. Warn in release too
-                // (the assert is debug-only) -- dropping geometry without a word is the real hazard.
-                // A clamp/sample/declare policy for arbitrary (e.g. OSL) shaders is deferred.
-                if (moved > max_disp + 1e-6)
-                    BOOST_LOG_TRIVIAL(warning)
-                        << "PrintMan: displacement of " << moved << " mm exceeded the declared bound "
-                        << max_disp << " mm; geometry that displaced past this band may be missing "
-                           "from the slice. Raise DisplacementField::max_magnitude to bound the shader.";
-                assert(moved <= max_disp + 1e-6);
-            }
-            // Colour is sampled on the displaced, full-region triangles BEFORE the band drop, so tri_uv stays
-            // parallel to its.indices; an out-of-band triangle crosses none of this band's layers, so it
-            // deposits nothing -- identical result to sampling after the drop, minus the desync.
-            if (color && bands_local)
+        // The core selects this band's faces (grown by max_disp), dices them adaptively, displaces via
+        // the bridged shader, and hands back one band mesh (nbands=1 -- the host owns the band split
+        // here). do_slice=false: the host colours + slices the mesh with slice_mesh_ex below.
+        const auto on_core_band = [&](const printman::Mesh &bm) {
+            if (bm.tri.empty())
+                return;
+            indexed_triangle_set its;
+            append_core_mesh_to_its(bm, its);
+            // An out-of-band triangle crosses none of this band's layers, so it deposits no colour and
+            // slices to nothing -- the band mesh spans only this band's z (plus the max_disp halo).
+            if (color && bands_local) {
+                const std::vector<std::array<float, 2>> tri_uv = tri_uv_from_core_mesh(bm);
                 accumulate_color_bands(its, zs, first, last, color, tri_uv, *bands_local);
-            drop_triangles_outside_band(its, zlo, zhi);
-            assert(displacement || band_is_closed_over(its, zlo, zhi));  // closedness is a non-displaced guarantee
-
+            }
             MeshSlicingParamsEx p = params;
             p.trafo = Transform3d::Identity();
             p.slicing_mode_normal_below_layer = params.slicing_mode_normal_below_layer > first
@@ -477,7 +458,9 @@ static void slice_cage_placement(const CageProto &cp,
             std::vector<ExPolygons>  sub = slice_mesh_ex(its, band_zs, p, throw_on_cancel);
             accumulate_sections(out_local, first, sub);
             throw_on_cancel();
-        }
+        };
+        printman::amplify_subcage_adaptive(core_cage, /*ctag*/ {}, core_shaders, level, params.subdiv_tol,
+                                           band_zs_d, /*nbands*/ 1, on_core_band, /*do_slice*/ false);
         if (on_band) on_band();   // one band done -- advance the status bar (see slice_scene)
     };
 

@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "printman/geom.hpp"
+#include "PrintMan/Core/geom.hpp"
 
 namespace printman {
 

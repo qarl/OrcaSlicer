@@ -12,10 +12,10 @@
 #include <string>
 #include <vector>
 
-#include "printman/geom.hpp"
-#include "printman/shader.hpp"
-#include "printman/subdiv.hpp"
-#include "printman/usd.hpp"
+#include "PrintMan/Core/geom.hpp"
+#include "PrintMan/Core/shader.hpp"
+#include "PrintMan/Core/subdiv.hpp"
+#include "PrintMan/Core/usd.hpp"
 
 namespace printman {
 

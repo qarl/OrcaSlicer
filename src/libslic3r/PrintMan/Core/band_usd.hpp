@@ -19,12 +19,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "printman/amplify.hpp"   // child_face_tags, subdiv_step, merge_meshes
-#include "printman/geom.hpp"
-#include "printman/shader.hpp"
-#include "printman/slicer.hpp"
-#include "printman/subdiv.hpp"
-#include "printman/usd.hpp"
+#include "PrintMan/Core/amplify.hpp"   // child_face_tags, subdiv_step, merge_meshes
+#include "PrintMan/Core/geom.hpp"
+#include "PrintMan/Core/shader.hpp"
+#include "PrintMan/Core/slicer.hpp"
+#include "PrintMan/Core/subdiv.hpp"
+#include "PrintMan/Core/usd.hpp"
 
 namespace printman {
 
@@ -34,21 +34,18 @@ namespace printman {
 // RenderMan) so displacement resolves on it. Returns per-layer slice segments.
 // on_band, if set, is handed each band's mesh before it's freed (e.g. to render it). do_slice=false
 // skips the slice (for a render-only pass at a different dicing level), returning empty layers.
-inline std::vector<LayerSegs> amplify_usd_banded(const UsdCage& uc,
+inline std::vector<LayerSegs> amplify_subcage_banded(subdiv::Cage cage, std::vector<int> ctag,
         const std::vector<const Shader*>& shaders, int level,
         const std::vector<double>& zs, int nbands,
         const std::function<void(const Mesh&)>& on_band = {}, bool do_slice = true,
         const std::string& dice_scheme = "catmullClark") {
     std::vector<LayerSegs> out(zs.size());
     const size_t nz = zs.size();
-    if (nz == 0 || nbands < 1) return out;
+    if (nz == 0 || nbands < 1 || shaders.empty()) return out;
 
-    subdiv::Cage cage = subdiv::build_cage(uc.points, uc.counts, uc.indices,
-                                           uc.crease_indices, uc.crease_lengths, uc.crease_sharpnesses,
-                                           uc.corner_indices, uc.corner_sharpnesses,
-                                           uc.boundary, uc.triangle_smooth, uc.st);
     const auto vf = subdiv::vertex_faces(cage);
     const int nf = cage.nfaces();
+    if (int(ctag.size()) != nf) ctag.assign(nf, 0);
 
     // Per control face: world-Z bound over its 1-ring control vertices (points are already Z-up).
     // A CC limit patch of face f is contained in this hull, so displaced it lies within ±max_reach.
@@ -63,7 +60,6 @@ inline std::vector<LayerSegs> amplify_usd_banded(const UsdCage& uc,
 
     double max_disp = 0;
     for (const Shader* s : shaders) max_disp = std::max(max_disp, s->max_reach());
-    const std::vector<int> ctag = uc.face_material.empty() ? std::vector<int>(nf, 0) : uc.face_material;
     const int M = int(shaders.size());
 
     for (int b = 0; b < nbands; ++b) {
@@ -144,18 +140,40 @@ inline std::vector<LayerSegs> amplify_usd_banded(const UsdCage& uc,
     return out;
 }
 
-// ADAPTIVE Catmull-Clark: dice each control face to its OWN edge scale, not one global level. Refine
-// the band's region uniformly to the global level `level` (so a core face's refined vertices are
-// shared/bit-identical across bands -- the invariance gate stays pixel-exact), then emit a COARSER
-// per-face grid whose four sides each carry that control edge's own device_level. A shared control
-// edge gives both faces the same level and the same lattice nodes, so the seam matches (crack-free),
-// while a large flat face emits far fewer micropolygons. The (2^level+1)^2 vertex lattice is read off
-// a TEMPLATE (a single parametric quad refined once: fvar refines to an exact dyadic (i,j), and the
-// quad-child ordering is universal), so no per-band parametric pass is needed. A non-quad control
-// cage is made all-quad by ONE Catmull-Clark step first (its limit surface is unchanged, since
-// subdivision is associative), after which the same all-quad machinery dices it -- so any subdiv cage
-// (UV-sphere poles, n-gons) gets adaptive dicing, not the uniform fallback.
-inline std::vector<LayerSegs> amplify_usd_adaptive(const UsdCage& uc,
+// UNIFORM band amplification from a USD cage description: build the control cage, then dice it via
+// amplify_subcage_banded (emits every micropolygon of the refined mesh -- no adaptive template, so it
+// is the correctness reference the adaptive path is checked against).
+inline std::vector<LayerSegs> amplify_usd_banded(const UsdCage& uc,
+        const std::vector<const Shader*>& shaders, int level,
+        const std::vector<double>& zs, int nbands,
+        const std::function<void(const Mesh&)>& on_band = {}, bool do_slice = true,
+        const std::string& dice_scheme = "catmullClark") {
+    subdiv::Cage cage = subdiv::build_cage(uc.points, uc.counts, uc.indices,
+                                           uc.crease_indices, uc.crease_lengths, uc.crease_sharpnesses,
+                                           uc.corner_indices, uc.corner_sharpnesses,
+                                           uc.boundary, uc.triangle_smooth, uc.st);
+    return amplify_subcage_banded(std::move(cage), uc.face_material, shaders, level,
+                                  zs, nbands, on_band, do_slice, dice_scheme);
+}
+
+// ADAPTIVE Catmull-Clark on an ALREADY-BUILT control cage. A host that already holds the cage (e.g.
+// OrcaSlicer's usd_subdiv::Cage, structurally identical to subdiv::Cage) calls this directly, skipping
+// the USD-description round-trip; amplify_usd_adaptive below is the thin wrapper that builds the cage
+// from a UsdCage first. `ctag` is the per-control-face material index (empty or wrong-sized -> all 0).
+// The cage and ctag are taken BY VALUE because the non-quad pre-step rewrites them.
+//
+// Dice each control face to its OWN edge scale, not one global level. Refine the band's region
+// uniformly to the global level `level` (so a core face's refined vertices are shared/bit-identical
+// across bands -- the invariance gate stays pixel-exact), then emit a COARSER per-face grid whose four
+// sides each carry that control edge's own device_level. A shared control edge gives both faces the
+// same level and the same lattice nodes, so the seam matches (crack-free), while a large flat face
+// emits far fewer micropolygons. The (2^level+1)^2 vertex lattice is read off a TEMPLATE (a single
+// parametric quad refined once: fvar refines to an exact dyadic (i,j), and the quad-child ordering is
+// universal), so no per-band parametric pass is needed. A non-quad control cage is made all-quad by
+// ONE Catmull-Clark step first (its limit surface is unchanged, since subdivision is associative),
+// after which the same all-quad machinery dices it -- so any subdiv cage (UV-sphere poles, n-gons)
+// gets adaptive dicing, not the uniform fallback.
+inline std::vector<LayerSegs> amplify_subcage_adaptive(subdiv::Cage cage, std::vector<int> ctag,
         const std::vector<const Shader*>& shaders, int level, double tol,
         const std::vector<double>& zs, int nbands,
         const std::function<void(const Mesh&)>& on_band = {}, bool do_slice = true) {
@@ -163,13 +181,8 @@ inline std::vector<LayerSegs> amplify_usd_adaptive(const UsdCage& uc,
     const size_t nz = zs.size();
     if (nz == 0 || nbands < 1) return out;
     int Lg = std::max(level, 0);
-
-    subdiv::Cage cage = subdiv::build_cage(uc.points, uc.counts, uc.indices,
-                                           uc.crease_indices, uc.crease_lengths, uc.crease_sharpnesses,
-                                           uc.corner_indices, uc.corner_sharpnesses,
-                                           uc.boundary, uc.triangle_smooth, uc.st);
     // Per-control-face material tag, remapped below if we pre-subdivide a non-quad cage.
-    std::vector<int> ctag = uc.face_material.empty() ? std::vector<int>(cage.nfaces(), 0) : uc.face_material;
+    if (ctag.empty() || int(ctag.size()) != cage.nfaces()) ctag.assign(cage.nfaces(), 0);
 
     // A non-quad control cage: take ONE Catmull-Clark step, which turns every face into quads without
     // changing the limit surface (subdivide chains catmull_clark, carrying creases + UV), so the whole
@@ -265,10 +278,18 @@ inline std::vector<LayerSegs> amplify_usd_adaptive(const UsdCage& uc,
         std::vector<V3> av(maxna);
         const bool hasuv = r.has_uv();
 
+        // Weld emitted vertices by refined-vertex id (shared across faces via r), so a boundary lattice
+        // node is emitted -- and its shader evaluated -- ONCE, not once per incident face. This keeps
+        // the surface crack-free even when the shader is non-deterministic across threads (a double
+        // emit would otherwise diverge and tear), and halves shader calls. Per material part.
+        std::vector<std::vector<std::int32_t>> vidx(M);
+        for (int m = 0; m < M; ++m) vidx[m].assign(r.verts.size(), -1);
+
         for (int fl = 0; fl < ncore; ++fl) {
             const int orig = core[fl];
             int mi = (orig < int(ctag.size())) ? ctag[orig] : 0; if (mi < 0 || mi >= M) mi = 0;
             Mesh& mm = parts[mi]; const Shader& sh = *shaders[mi]; const int nak = na[mi];
+            std::vector<std::int32_t>& vmap = vidx[mi];   // refined-vertex id -> mesh index in this part
             // reconstruct this face's lattice: leaf block [fl*S^2, (fl+1)*S^2), corner c -> tmpl node.
             // 64-bit leaf index: at level 8 a face is 65536 leaves, so fl*S*S overflows int past ~32k faces.
             const long long lo = (long long)fl * S * S;
@@ -283,7 +304,9 @@ inline std::vector<LayerSegs> amplify_usd_adaptive(const UsdCage& uc,
                 int li = (int)std::llround(s * S), lj = (int)std::llround(t * S);
                 int corner = latflat[(size_t)lj * (S + 1) + li];
                 assert(corner >= 0 && "lattice node not populated -- template/coverage broke");
-                int vid = r.fvi[corner]; const auto& P = r.verts[vid]; const V3& N = vn[vid];
+                int vid = r.fvi[corner];
+                if (vmap[vid] >= 0) return (std::uint32_t)vmap[vid];   // already emitted -> weld to it
+                const auto& P = r.verts[vid]; const V3& N = vn[vid];
                 V3 Pv{{P[0], P[1], P[2]}};
                 V2 uv = hasuv ? V2{{r.fvar[corner][0], r.fvar[corner][1]}} : V2{{0, 0}};
                 double d = sh.displace(Pv, N, uv); sh.shade(Pv, N, uv, av.data());
@@ -292,6 +315,7 @@ inline std::vector<LayerSegs> amplify_usd_adaptive(const UsdCage& uc,
                 mm.nrm.push_back({(float)N[0], (float)N[1], (float)N[2]});
                 mm.uv.push_back({(float)uv[0], (float)uv[1]});
                 for (int k = 0; k < nak; ++k) mm.aov[k].push_back({(float)av[k][0], (float)av[k][1], (float)av[k][2]});
+                vmap[vid] = (std::int32_t)id;
                 return id;
             };
             std::vector<std::uint32_t> idx((size_t)(Ns + 1) * (Nt + 1));
@@ -312,6 +336,21 @@ inline std::vector<LayerSegs> amplify_usd_adaptive(const UsdCage& uc,
         if (on_band) on_band(bm);
     }
     return out;
+}
+
+// ADAPTIVE Catmull-Clark from a USD cage description: build the control cage (points/counts/indices +
+// creases/corners/boundary/UV), then dice it via amplify_subcage_adaptive. The standalone CLI reads a
+// UsdCage from USD and calls this; a host holding a built cage calls amplify_subcage_adaptive directly.
+inline std::vector<LayerSegs> amplify_usd_adaptive(const UsdCage& uc,
+        const std::vector<const Shader*>& shaders, int level, double tol,
+        const std::vector<double>& zs, int nbands,
+        const std::function<void(const Mesh&)>& on_band = {}, bool do_slice = true) {
+    subdiv::Cage cage = subdiv::build_cage(uc.points, uc.counts, uc.indices,
+                                           uc.crease_indices, uc.crease_lengths, uc.crease_sharpnesses,
+                                           uc.corner_indices, uc.corner_sharpnesses,
+                                           uc.boundary, uc.triangle_smooth, uc.st);
+    return amplify_subcage_adaptive(std::move(cage), uc.face_material, shaders, level, tol,
+                                    zs, nbands, on_band, do_slice);
 }
 
 // Estimate of the micropolygon-triangle count amplify_usd_adaptive emits at (level, tol) -- one
