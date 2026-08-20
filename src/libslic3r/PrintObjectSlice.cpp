@@ -108,11 +108,14 @@ static std::vector<ExPolygons> slice_volume(
             // terminals (loaded once). A load failure degrades to no displacement / no colour, loudly.
             const std::string &disp_name = volume.printman_scene->osl_displacement_shader;
             const std::string &surf_name = volume.printman_scene->osl_surface_shader;
-            // A self-contained .usdz bundles its shaders+maps; the loader extracted them here. Otherwise the
-            // shaders resolve by id from the built-in dir compiled into the binary.
+            // A self-contained .usdz bundles its shaders+maps; the loader extracted them to
+            // osl_shader_searchpath. Search that FIRST, then fall back to the built-in dir compiled into the
+            // binary (OSL/OIIO take a ':'-separated path): a bundle wins for what it carries, so it is still
+            // portable, while a partial bundle -- only its maps, or only some shaders -- still resolves the
+            // rest from the stock library. A non-existent dir on the path is simply skipped.
             const std::string osl_dir = volume.printman_scene->osl_shader_searchpath.empty()
                 ? std::string(PRINTMAN_OSL_SHADER_DIR)
-                : volume.printman_scene->osl_shader_searchpath;
+                : volume.printman_scene->osl_shader_searchpath + ":" + PRINTMAN_OSL_SHADER_DIR;
             std::optional<PrintMan::OslDisplaceShader> disp_osl, surf_osl;
             auto load_osl = [&osl_dir](const std::string &name, std::optional<PrintMan::OslDisplaceShader> &slot,
                                        const char *role) {

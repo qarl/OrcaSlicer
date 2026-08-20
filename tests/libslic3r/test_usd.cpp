@@ -2421,5 +2421,12 @@ TEST_CASE("A self-contained .usdz slices from its bundled shaders and maps", "[u
     const double d = disp(PrintMan::V3{{0.0, 0.0, 10.0}}, PrintMan::V3{{0.0, 0.0, 1.0}},
                           PrintMan::V3{{0, 0, 0}}, PrintMan::V3{{0, 0, 0}}, 0.3, 0.6);
     CHECK(std::isfinite(d));
+
+    // Partial-bundle robustness: the slice loop searches the bundle FIRST, then the built-in dir on one
+    // ':'-separated path, so a .usdz that carries only some assets still resolves the rest from the stock
+    // library. A shader NOT in this bundle loads from the built-in fallback on that combined path.
+    const std::string combined = sc.osl_shader_searchpath + ":" + std::string(PRINTMAN_OSL_SHADER_DIR);
+    PrintMan::OslDisplaceShader builtin_fallback(combined, "printman_spectrum");   // built-in, not bundled
+    CHECK(builtin_fallback.has_color());
 }
 #endif // SLIC3R_OSL
