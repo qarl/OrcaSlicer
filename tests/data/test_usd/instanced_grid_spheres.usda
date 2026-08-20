@@ -12,9 +12,10 @@
 #
 # Two instances of ONE UV-sphere Catmull-Clark prototype, each carrying the printman_grid shader on BOTH the
 # surface (Cout: red ribs / blue grooves) and displacement (Disp: a raised world-space lattice). The lattice
-# is a function of world position, so each sphere -- 125mm apart in X, not a whole multiple of the 1.5mm
-# lattice pitch -- wears the grid at a different phase. The grid shader is bundled INTO the .usdz, so the model
-# needs nothing on the build-time shader path to slice.
+# is a function of world position, so each sphere -- 125mm apart in X, not a whole multiple of the 8mm lattice
+# pitch the material sets -- wears the grid at a different phase. The Pitch/Groove inputs on the shader show a
+# material tuning its shader (the .osl defaults are finer). The grid shader is bundled INTO the .usdz, so the
+# model needs nothing on the build-time shader path to slice.
 def "Prototypes"
 {
     class Xform "Proto"
@@ -38,6 +39,8 @@ def "Prototypes"
                 {
                     uniform token info:id = "printman_grid"
                     float inputs:printman:maxMagnitude = 8
+                    float inputs:Pitch = 8              // coarse lattice (shader default is 1.5) -- set by the material
+                    float inputs:Groove = 4
                     token outputs:out
                 }
             }

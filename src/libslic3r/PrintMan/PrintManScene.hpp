@@ -20,6 +20,17 @@ struct Placement
     Transform3d xform     = Transform3d::Identity();
 };
 
+// One authored OSL shader parameter carried from the USD material -- an `inputs:<name>` on the shader prim,
+// outside the printman: namespace (which is host directives, not shader params). Forwarded to the OSL shader
+// at load so a material can tune its shader (e.g. a grid's Pitch) instead of running on the .osl defaults.
+// v1 carries the scalar types PrintMan shaders use, float and int (bool as int); colour/string are follow-ups.
+struct ShaderParam
+{
+    std::string name;            // the OSL parameter name, e.g. "Pitch"
+    bool        is_int = false;  // int (or bool) parameter; else float
+    double      value  = 0.0;    // the authored value (an int parameter holds an integral value here)
+};
+
 // The OSL shaders of one material -- the same shape USD models shading (a `surface` and a `displacement`
 // terminal, each an .oso on the searchpath) plus the PrintMan colour directives. A prim binds one material
 // to the whole mesh (its default), and a UsdGeomSubset may bind another to a face region; PrintManScene
@@ -33,6 +44,8 @@ struct MaterialShaders
     bool        object_space  = false;   // printman:objectSpace  -- feed the colour shader an object-normalized Z
     bool        dither        = false;   // printman:dither       -- spatially blend across the two nearest filaments
     bool        all_filaments = false;   // printman:allFilaments -- dither across every loaded filament
+    std::vector<ShaderParam> surface_params;       // authored inputs on the surface shader prim
+    std::vector<ShaderParam> displacement_params;  // authored inputs on the displacement shader prim
 };
 
 // A subdivision control cage as raw USD attributes in the prototype's local frame, refined at slice
@@ -77,6 +90,10 @@ struct PrintManScene
     std::string osl_surface_shader;         // material:surface      -> Cout (colour)
     std::string osl_displacement_shader;    // material:displacement -> Disp (relief)
     double      osl_max_displacement = 0.0;
+    // Authored parameters on material 0's shaders, forwarded to OSL at load so the material can tune its
+    // shader (e.g. a grid's Pitch) instead of running on the .osl defaults. See PrintObjectSlice.
+    std::vector<ShaderParam> osl_surface_params;
+    std::vector<ShaderParam> osl_displacement_params;
     // Region materials beyond the default: a UsdGeomSubset may bind a different material to a face region,
     // so a single mesh prints each region in its own surface + displacement shader. The scalar fields above
     // are material 0 (the mesh's own binding, and the fallback for any face in no subset); extra_materials[k]

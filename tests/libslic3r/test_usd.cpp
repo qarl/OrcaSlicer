@@ -2811,8 +2811,20 @@ TEST_CASE("The grid shader rides bundled in a .usdz onto sphere instances", "[us
     REQUIRE(std::filesystem::is_directory(dir));
     CHECK(std::filesystem::exists(dir / "printman_grid.oso"));
 
-    // The bundled shader loads from that searchpath and carries both a displacement and a colour output.
-    auto grid = std::make_shared<PrintMan::OslDisplaceShader>(sc.osl_shader_searchpath, "printman_grid");
+    // The material tuned its shader from the USD: Pitch/Groove authored as inputs on the shader prim were read
+    // into the scene's shader params (the .osl defaults are finer). They are forwarded to OSL at load below.
+    auto has_param = [&](const char *n, double v) {
+        for (const PrintMan::ShaderParam &p : sc.osl_displacement_params)
+            if (p.name == n && ! p.is_int && std::abs(p.value - v) < 1e-6) return true;
+        return false;
+    };
+    CHECK(has_param("Pitch", 8.0));
+    CHECK(has_param("Groove", 4.0));
+
+    // The bundled shader loads from that searchpath, tuned by the material's params, and carries both a
+    // displacement and a colour output.
+    auto grid = std::make_shared<PrintMan::OslDisplaceShader>(
+        sc.osl_shader_searchpath, "printman_grid", "Disp", "Cout", sc.osl_displacement_params);
     CHECK(grid->has_color());
 
     // The instancing payoff, checked directly: the grid is a function of WORLD position, so the SAME surface
@@ -2913,5 +2925,27 @@ SCENARIO_METHOD(UsdResourcesFixture, "The bundled grid spheres slice through Orc
             REQUIRE(layers[layers.size() / 2]->lslices.size() == 2);   // the two sphere instances
         }
     }
+}
+
+// A material can TUNE its shader: the same OSL shader loaded with a different authored parameter evaluates
+// differently. printman_grid at its .osl default Pitch (1.5) versus a material-set Pitch=8 gives a different
+// lattice at the same point -- proof the parameter reaches the shader (through ShaderGroup Parameter), rather
+// than being dropped and the shader running on its defaults. Uses the built-in shader, no fixture.
+TEST_CASE("An authored shader parameter reaches the OSL shader", "[usd][printman][osl][params]")
+{
+    const std::string dir = PRINTMAN_OSL_SHADER_DIR;
+    PrintMan::OslDisplaceShader def(dir, "printman_grid");
+    PrintMan::OslDisplaceShader coarse(dir, "printman_grid", "Disp", "Cout",
+                                       {{"Pitch", false, 8.0}, {"Groove", false, 4.0}});
+    int differ = 0;
+    for (int i = 0; i < 40; ++ i) {
+        const double t = 0.3 * i;
+        const PrintMan::V3 p{{t, 0.5 * t, 2.0 + 0.1 * t}};
+        const PrintMan::V3 n{{0.0, 0.0, 1.0}};
+        const double d0 = def   (p, n, PrintMan::V3{{0, 0, 0}}, PrintMan::V3{{0, 0, 0}}, 0.0, 0.0);
+        const double d1 = coarse(p, n, PrintMan::V3{{0, 0, 0}}, PrintMan::V3{{0, 0, 0}}, 0.0, 0.0);
+        if (std::abs(d0 - d1) > 1e-4) ++ differ;
+    }
+    CHECK(differ > 0);   // the Pitch parameter changed the lattice -> it was forwarded, not defaulted
 }
 #endif // SLIC3R_OSL

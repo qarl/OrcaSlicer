@@ -122,15 +122,15 @@ static std::vector<ExPolygons> slice_volume(
                 : volume.printman_scene->osl_shader_searchpath + ":" + PRINTMAN_OSL_SHADER_DIR;
             std::optional<PrintMan::OslDisplaceShader> disp_osl, surf_osl;
             auto load_osl = [&osl_dir](const std::string &name, std::optional<PrintMan::OslDisplaceShader> &slot,
-                                       const char *role) {
-                try { slot.emplace(osl_dir, name); }
+                                       const char *role, const std::vector<PrintMan::ShaderParam> &params) {
+                try { slot.emplace(osl_dir, name, "Disp", "Cout", params); }
                 catch (const std::exception &e) {
                     BOOST_LOG_TRIVIAL(error) << "PrintMan: could not load OSL " << role << " shader '"
                         << name << "': " << e.what() << "; slicing without it.";
                 }
             };
             if (! disp_name.empty()) {
-                load_osl(disp_name, disp_osl, "displacement");
+                load_osl(disp_name, disp_osl, "displacement", volume.printman_scene->osl_displacement_params);
                 if (disp_osl) {
                     disp.eval_d        = [&disp_osl](const PrintMan::V3 &p, const PrintMan::V3 &n,
                                                      const PrintMan::V3 &dPdx, const PrintMan::V3 &dPdy,
@@ -141,7 +141,7 @@ static std::vector<ExPolygons> slice_volume(
             // The colour shader is the dedicated surface one, or the displacement one when a single shader
             // backs both terminals (surf_name == disp_name).
             if (! surf_name.empty() && surf_name != disp_name)
-                load_osl(surf_name, surf_osl, "surface");
+                load_osl(surf_name, surf_osl, "surface", volume.printman_scene->osl_surface_params);
             const PrintMan::OslDisplaceShader *color_osl =
                 surf_osl ? &*surf_osl
                          : (! surf_name.empty() && surf_name == disp_name && disp_osl ? &*disp_osl : nullptr);
@@ -156,7 +156,8 @@ static std::vector<ExPolygons> slice_volume(
                 PrintMan::DisplacementField f;
                 if (! mat.displacement.empty()) {
                     try {
-                        auto sh = std::make_shared<PrintMan::OslDisplaceShader>(osl_dir, mat.displacement);
+                        auto sh = std::make_shared<PrintMan::OslDisplaceShader>(
+                            osl_dir, mat.displacement, "Disp", "Cout", mat.displacement_params);
                         f.eval_d = [sh](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dPdx,
                                         const PrintMan::V3 &dPdy, double u, double v) { return (*sh)(p, n, dPdx, dPdy, u, v); };
                         f.max_magnitude = mat.max_displacement;

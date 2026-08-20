@@ -33,7 +33,8 @@
 #include <OpenImageIO/texture.h>
 #include <OpenImageIO/ustring.h>
 
-#include "libslic3r/PrintMan/Displace.hpp"   // V3, DisplaceShader
+#include "libslic3r/PrintMan/Displace.hpp"       // V3, DisplaceShader
+#include "libslic3r/PrintMan/PrintManScene.hpp"   // ShaderParam
 
 namespace Slic3r { namespace PrintMan {
 
@@ -55,7 +56,8 @@ public:
     OslDisplaceShader(const std::string &searchpath,
                       const std::string &shadername,
                       const std::string &disp_output  = "Disp",
-                      const std::string &color_output = "Cout")
+                      const std::string &color_output = "Cout",
+                      const std::vector<ShaderParam> &params = {})
         : m_ts(OIIO::TextureSystem::create(/*shared=*/false)), m_rend(m_ts.get()),
           m_output(disp_output), m_color_output(color_output), m_layer("layer1")
     {
@@ -69,6 +71,17 @@ public:
         m_ss->attribute("searchpath:shader", OIIO::TypeDesc::STRING, &sp);
 
         m_group = m_ss->ShaderGroupBegin("printman");
+        // Authored material parameters override the shader's .osl defaults. Set BEFORE Shader() so they bind
+        // to this layer; a name the shader does not declare is ignored (it simply keeps its default).
+        for (const ShaderParam &p : params) {
+            if (p.is_int) {
+                const int v = int(p.value);
+                m_ss->Parameter(*m_group, p.name, OIIO::TypeDesc(OIIO::TypeDesc::INT), &v);
+            } else {
+                const float v = float(p.value);
+                m_ss->Parameter(*m_group, p.name, OIIO::TypeDesc(OIIO::TypeDesc::FLOAT), &v);
+            }
+        }
         if (!m_ss->Shader(*m_group, "surface", shadername, m_layer)) {
             m_group.reset();          // same order as the dtor: group before system
             delete m_ss;

@@ -239,6 +239,9 @@ struct NamedMesh
     bool                                color_object_space  = false;
     bool                                color_dither        = false;
     bool                                color_all_filaments = false;
+    // Authored shader parameters on material 0's surface/displacement shaders (see PrintManScene).
+    std::vector<PrintMan::ShaderParam>  surface_params;
+    std::vector<PrintMan::ShaderParam>  displacement_params;
     // Region materials beyond the prim's own (material 0, the scalar fields above): materials bound by
     // UsdGeomSubset face regions, selected per control face by `cage->face_material`. Empty = single material.
     std::vector<PrintMan::MaterialShaders> extra_materials;
@@ -410,10 +413,46 @@ PrintMan::SubdivCage read_subdiv_cage(const UsdGeomMesh &mesh, UsdTimeCode when,
 // allFilaments) and the displacement clamp (maxMagnitude) are PrintMan slicer directives, not OSL parameters,
 // so they are authored under the printman: input namespace (inputs:printman:*) to keep them from colliding
 // with a real shader parameter of the same name.
+// The shader's own authored inputs, forwarded to OSL so a material can tune its shader. The printman:
+// namespace is host directives (maxMagnitude, objectSpace, ...) read separately, not shader parameters, so
+// it is skipped here. v1 carries float and int (bool as int) -- the scalar types PrintMan shaders declare.
+static std::vector<PrintMan::ShaderParam> read_shader_params(const UsdShadeShader &s, UsdTimeCode when)
+{
+    std::vector<PrintMan::ShaderParam> out;
+    for (const UsdShadeInput &in : s.GetInputs()) {
+        const std::string name = in.GetBaseName().GetString();
+        if (name.rfind("printman:", 0) == 0)
+            continue;   // a host directive, not a shader parameter
+        const SdfValueTypeName t = in.GetTypeName();
+        PrintMan::ShaderParam p;
+        p.name = name;
+        if (t == SdfValueTypeNames->Float) {
+            float v = 0.0f;
+            if (in.Get(&v, when)) { p.value = v; out.push_back(p); }
+        } else if (t == SdfValueTypeNames->Double) {
+            double v = 0.0;
+            if (in.Get(&v, when)) { p.value = v; out.push_back(p); }
+        } else if (t == SdfValueTypeNames->Int) {
+            int v = 0;
+            if (in.Get(&v, when)) { p.is_int = true; p.value = v; out.push_back(p); }
+        } else if (t == SdfValueTypeNames->Bool) {
+            bool v = false;
+            if (in.Get(&v, when)) { p.is_int = true; p.value = v ? 1.0 : 0.0; out.push_back(p); }
+        } else {
+            // Loudly, not silently: an unsupported type is dropped, so the author knows why their parameter
+            // did not take instead of the shader quietly keeping its default. Colour/vector/string: a follow-up.
+            BOOST_LOG_TRIVIAL(warning) << "PrintMan: shader parameter '" << name << "' has unsupported type '"
+                << t.GetAsToken().GetString() << "'; not forwarded to OSL (float/double/int/bool only), so the "
+                   "shader keeps its .osl default for it.";
+        }
+    }
+    return out;
+}
+
 static PrintMan::MaterialShaders read_material_shaders(const UsdShadeMaterial &mat, UsdTimeCode when)
 {
     PrintMan::MaterialShaders pm;
-    // surface terminal -> colour shader + its colour hints
+    // surface terminal -> colour shader + its colour hints + its authored parameters
     if (const UsdShadeShader s = mat.ComputeSurfaceSource()) {
         TfToken id;
         if (s.GetShaderId(&id))
@@ -421,14 +460,16 @@ static PrintMan::MaterialShaders read_material_shaders(const UsdShadeMaterial &m
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:objectSpace")))  in.Get(&pm.object_space,  when);
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:dither")))       in.Get(&pm.dither,        when);
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:allFilaments"))) in.Get(&pm.all_filaments, when);
+        pm.surface_params = read_shader_params(s, when);
     }
-    // displacement terminal -> relief shader + its clamp
+    // displacement terminal -> relief shader + its clamp + its authored parameters
     if (const UsdShadeShader s = mat.ComputeDisplacementSource()) {
         TfToken id;
         if (s.GetShaderId(&id))
             pm.displacement = id.GetString();
         float m = 0.0f;
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:maxMagnitude"))) { in.Get(&m, when); pm.max_displacement = m; }
+        pm.displacement_params = read_shader_params(s, when);
     }
     return pm;
 }
@@ -796,7 +837,9 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
 
             out.push_back({prim.GetPath().GetString(), std::move(its), std::move(deferred_cage),
                            cage_xform, pm.surface, pm.displacement, pm.max_displacement,
-                           pm.object_space, pm.dither, pm.all_filaments, std::move(extra_materials)});
+                           pm.object_space, pm.dither, pm.all_filaments,
+                           std::move(pm.surface_params), std::move(pm.displacement_params),
+                           std::move(extra_materials)});
             ++ mesh_count;
 
             // Counted only once the mesh is actually emitted. Counting it at the
@@ -1118,6 +1161,8 @@ void build_instance_scene(const UsdStageRefPtr &stage, UsdTimeCode when,
                 scene.color_object_space      = pm.object_space;
                 scene.color_dither            = pm.dither;
                 scene.color_all_filaments     = pm.all_filaments;
+                scene.osl_surface_params      = pm.surface_params;
+                scene.osl_displacement_params = pm.displacement_params;
                 shading_set = true;
             }
             if (is_cage)
@@ -1374,6 +1419,8 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
             scene.color_object_space   = m.color_object_space;   // colour-shader hints from the prim
             scene.color_dither         = m.color_dither;
             scene.color_all_filaments  = m.color_all_filaments;
+            scene.osl_surface_params      = std::move(m.surface_params);       // authored shader parameters
+            scene.osl_displacement_params = std::move(m.displacement_params);
             scene.extra_materials      = std::move(m.extra_materials);   // region materials (cage->face_material selects)
             add_scene_volume(model, object, m.name, path, std::move(scene));
         } else {
