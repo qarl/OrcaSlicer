@@ -2815,6 +2815,29 @@ TEST_CASE("The grid shader rides bundled in a .usdz onto sphere instances", "[us
     auto grid = std::make_shared<PrintMan::OslDisplaceShader>(sc.osl_shader_searchpath, "printman_grid");
     CHECK(grid->has_color());
 
+    // The instancing payoff, checked directly: the grid is a function of WORLD position, so the SAME surface
+    // point sampled at each instance's world location (X vs X+125) displaces differently. A per-instance grid
+    // differs at many of the prototype's own vertices; an object-local (buggy) grid would be identical at all.
+    REQUIRE(! sc.prototypes.empty());
+    const PrintMan::V3 ctr{{0.0, 0.0, 36.0}};   // sphere centre in prototype-local space
+    int    differ = 0;
+    double total  = 0.0;
+    for (const Vec3f &pv : sc.prototypes[0].vertices) {
+        PrintMan::V3 p0{{pv.x(), pv.y(), pv.z()}};
+        PrintMan::V3 nrm{{p0[0] - ctr[0], p0[1] - ctr[1], p0[2] - ctr[2]}};
+        const double L = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+        if (L < 1e-6) continue;
+        for (int k = 0; k < 3; ++ k) nrm[k] /= L;
+        const PrintMan::V3 p1{{p0[0] + 125.0, p0[1], p0[2]}};   // the second instance's world offset
+        const double d0 = (*grid)(p0, nrm, PrintMan::V3{{0, 0, 0}}, PrintMan::V3{{0, 0, 0}}, 0.0, 0.0);
+        const double d1 = (*grid)(p1, nrm, PrintMan::V3{{0, 0, 0}}, PrintMan::V3{{0, 0, 0}}, 0.0, 0.0);
+        if (std::abs(d0 - d1) > 1e-4) ++ differ;
+        total += std::abs(d0 - d1);
+    }
+    INFO("grid differs at " << differ << " of " << sc.prototypes[0].vertices.size()
+         << " prototype vertices, total |d0-d1|=" << total << " mm");
+    CHECK(differ > 0);   // the two instances wear the grid at different phases -- world-space, not object-local
+
     // End to end: slice the instanced spheres with the bundled grid displacement and confirm the raised
     // lattice changes the geometry (a raised grid grows the sliced area outward). Same scene sliced plain is
     // the control. A modest equatorial band keeps the OSL slice quick.
