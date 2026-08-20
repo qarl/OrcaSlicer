@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -44,15 +45,22 @@ inline printman::subdiv::Cage to_core_cage(const usd_subdiv::Cage &c)
 // is passed zero -- point-sampled -- until the core carries it). Colour is NOT bridged: the host runs
 // its own colour pass on each band mesh, so shade emits only a neutral Cout the host ignores.
 struct BridgeShader : printman::Shader {
-    const DisplacementField *disp;
-    double                   reach;
+    const DisplacementField    *disp;
+    double                      reach;
+    mutable std::atomic<double> peak{0.0};   // largest |displacement| applied; the host warns if it exceeds reach
     BridgeShader(const DisplacementField *d, double r) : disp(d), reach(r) {}
     double displace(const printman::V3 &p, const printman::V3 &n, const printman::V2 &uv) const override
     {
         double d = 0.0;
         if      (disp->eval_d) d = disp->eval_d(p, n, V3{{0, 0, 0}}, V3{{0, 0, 0}}, uv[0], uv[1]);
         else if (disp->eval)   d = disp->eval(p, n);
-        return std::isfinite(d) ? d : 0.0;   // never propagate a NaN/Inf displacement into the geometry
+        if (! std::isfinite(d)) return 0.0;   // never propagate a NaN/Inf displacement into the geometry
+        // Record the peak magnitude across concurrently-diced bands (atomic max), so slice_cage_placement
+        // can warn when the relief pushes past the declared bound the slice band was grown by.
+        const double a = std::fabs(d);
+        for (double prev = peak.load(std::memory_order_relaxed);
+             a > prev && ! peak.compare_exchange_weak(prev, a, std::memory_order_relaxed); ) {}
+        return d;
     }
     std::vector<std::string> aov_names() const override { return {"Cout"}; }
     void shade(const printman::V3 &, const printman::V3 &, const printman::V2 &, printman::V3 *out) const override

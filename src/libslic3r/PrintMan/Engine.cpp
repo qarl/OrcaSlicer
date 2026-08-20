@@ -475,6 +475,16 @@ static void slice_cage_placement(const CageProto &cp,
                     slice_band(band_ranges[bi].first, band_ranges[bi].second);
             });
     });
+
+    // The band's face selection was grown by the declared max_disp; if the shader actually moved a vertex
+    // farther, relief past the grown band can be clipped by Orca's fixed layer set. Warn so the user raises
+    // printman:maxMagnitude (restores the over-bound check the pre-fold apply_displacement path had).
+    const double peak = bridge.peak.load(std::memory_order_relaxed);
+    if (max_disp > 0.0 && peak > max_disp + 1e-6)
+        BOOST_LOG_TRIVIAL(warning)
+            << "PrintMan: displacement reached " << peak << " mm, past the declared maxMagnitude "
+            << max_disp << " mm; relief beyond the grown slice band may be clipped -- raise"
+               " printman:maxMagnitude.";
 }
 
 std::vector<ExPolygons> slice_scene(
