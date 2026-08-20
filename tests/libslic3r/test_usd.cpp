@@ -1745,6 +1745,64 @@ SCENARIO_METHOD(UsdResourcesFixture, "PrintMan colour regenerates regions when a
     CHECK(nonempty[1] > 0);   // the re-slice must fill the 2nd-filament region
 }
 
+// A UsdGeomSubset that binds its own material to a face region turns one mesh into several: the importer
+// records a per-control-face material tag on the cage plus the list of region materials, so the slicer can
+// dice + displace each region through its own shader. cube_two_materials.usda binds a relief material
+// (printman_spectrum + printman_test_disp) to the top face and a flat material (printman_uv) to one side;
+// every other face keeps the mesh's own material (printman_gradient, material 0). This is the read side --
+// it asserts the tags, not the shading, so it needs no OSL.
+TEST_CASE("UsdGeomSubset face bindings become per-region materials on the cage", "[usd][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_two_materials.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    REQUIRE(! model.objects.empty());
+    REQUIRE(! model.objects.front()->volumes.empty());
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    const auto &sc = *vol->printman_scene;
+
+    // Material 0 is the mesh's own binding (the scalar fields), unchanged by the subsets.
+    CHECK(sc.osl_surface_shader == "printman_gradient");
+    CHECK(sc.osl_displacement_shader.empty());
+
+    // Two subsets rebound two regions, so two region materials were recorded.
+    REQUIRE(sc.extra_materials.size() == 2);
+
+    // One control cage, with a per-face material tag over its six faces.
+    REQUIRE(sc.cages.size() == 1);
+    const PrintMan::SubdivCage &cage = sc.cages.begin()->second;
+    REQUIRE(cage.face_material.size() == 6);
+
+    // Resolve a face's material by its tag: 0 -> the scene's scalar fields, k>=1 -> extra_materials[k-1].
+    // Asserting by content (not by index) keeps the test robust to the order GetAllGeomSubsets returns.
+    auto face_mat = [&](int f) -> PrintMan::MaterialShaders {
+        const int mi = cage.face_material[f];
+        if (mi == 0)
+            return {sc.osl_surface_shader, sc.osl_displacement_shader, sc.osl_max_displacement,
+                    sc.color_object_space, sc.color_dither, sc.color_all_filaments};
+        REQUIRE(mi - 1 < int(sc.extra_materials.size()));
+        return sc.extra_materials[mi - 1];
+    };
+
+    // Top face (index 1): the relief material -- printman_spectrum colour + printman_test_disp displacement.
+    const PrintMan::MaterialShaders top = face_mat(1);
+    CHECK(top.surface          == "printman_spectrum");
+    CHECK(top.displacement     == "printman_test_disp");
+    CHECK(top.max_displacement == Catch::Approx(0.3));
+
+    // A side face (index 3): the flat material -- printman_uv colour, no displacement.
+    const PrintMan::MaterialShaders side = face_mat(3);
+    CHECK(side.surface == "printman_uv");
+    CHECK(side.displacement.empty());
+
+    // Every other face keeps material 0 (the mesh's own gradient, no displacement).
+    for (const int f : {0, 2, 4, 5}) {
+        INFO("face " << f);
+        CHECK(cage.face_material[f] == 0);
+        CHECK(face_mat(f).surface == "printman_gradient");
+    }
+}
+
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
 // cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +

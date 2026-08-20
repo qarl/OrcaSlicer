@@ -20,6 +20,21 @@ struct Placement
     Transform3d xform     = Transform3d::Identity();
 };
 
+// The OSL shaders of one material -- the same shape USD models shading (a `surface` and a `displacement`
+// terminal, each an .oso on the searchpath) plus the PrintMan colour directives. A prim binds one material
+// to the whole mesh (its default), and a UsdGeomSubset may bind another to a face region; PrintManScene
+// carries the mesh material as its scalar osl_*/color_* fields (material 0) and any region materials in
+// extra_materials, with SubdivCage::face_material selecting per control face. See read_printman_material.
+struct MaterialShaders
+{
+    std::string surface;                 // material:surface      -> Cout (colour)
+    std::string displacement;            // material:displacement -> Disp (relief)
+    double      max_displacement = 0.0;  // printman:maxMagnitude -- grows the slice band so relief is not clipped
+    bool        object_space  = false;   // printman:objectSpace  -- feed the colour shader an object-normalized Z
+    bool        dither        = false;   // printman:dither       -- spatially blend across the two nearest filaments
+    bool        all_filaments = false;   // printman:allFilaments -- dither across every loaded filament
+};
+
 // A subdivision control cage as raw USD attributes in the prototype's local frame, refined at slice
 // time (see Format/USDSubdiv.hpp). The paired prototype mesh is its coarse control mesh.
 struct SubdivCage
@@ -37,6 +52,11 @@ struct SubdivCage
     bool                               triangle_smooth = false;  // triangleSubdivisionRule == "smooth"
     bool                               flip_winding    = false;  // orientation == leftHanded
     std::string                        scheme;                   // catmullClark | loop | bilinear
+    // Per control face, which material paints + displaces it: 0 = the scene's default material (its scalar
+    // osl_*/color_* fields), k>=1 = scene.extra_materials[k-1], authored via UsdGeomSubset face bindings.
+    // Empty = every face is material 0 (the single-material case), so the index maps straight to the core's
+    // per-control-face material tag (ctag). Length, when set, is the control-face count (face_counts.size()).
+    std::vector<int>                   face_material;
     // AABB of the refined surface (not the control cage, which over-estimates), for bed placement.
     std::array<double, 3>              refined_lo{{0, 0, 0}};
     std::array<double, 3>              refined_hi{{0, 0, 0}};
@@ -57,6 +77,12 @@ struct PrintManScene
     std::string osl_surface_shader;         // material:surface      -> Cout (colour)
     std::string osl_displacement_shader;    // material:displacement -> Disp (relief)
     double      osl_max_displacement = 0.0;
+    // Region materials beyond the default: a UsdGeomSubset may bind a different material to a face region,
+    // so a single mesh prints each region in its own surface + displacement shader. The scalar fields above
+    // are material 0 (the mesh's own binding, and the fallback for any face in no subset); extra_materials[k]
+    // is material k+1, selected per control face by SubdivCage::face_material. Empty = single-material (the
+    // scalar fields alone), which leaves every existing slice path byte-identical.
+    std::vector<MaterialShaders> extra_materials;
     // Where this scene's compiled shaders (.oso) and texture maps (.tx) live. Empty = the built-in
     // PRINTMAN_OSL_SHADER_DIR. A self-contained .usdz bundles them, so the loader extracts them once to a
     // cache dir and records it here, and the whole model -- geometry, shaders, maps -- is one portable file.

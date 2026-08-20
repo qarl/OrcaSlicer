@@ -1,0 +1,84 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# A subdivision cube whose faces bind DIFFERENT materials through UsdGeomSubset, so one mesh prints each
+# region in its own surface + displacement shader. The mesh's own binding (MatBase) is material 0 -- the
+# fallback for any face in no subset. Two face subsets rebind a region each: the top face (index 1) to a
+# relief material (printman_spectrum colour + printman_test_disp displacement), and a side face (index 3) to
+# a flat colour material (printman_uv). The importer turns these into a per-control-face material tag on the
+# cage plus a list of the region materials; the slicer then dices + displaces each region through its own
+# shader. Faces are in authored faceVertexCounts order: 0 bottom, 1 top, 2-5 sides.
+def Mesh "cube" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+    point3f[] points = [(-5, -5, 0), (5, -5, 0), (5, 5, 0), (-5, 5, 0), (-5, -5, 10), (5, -5, 10), (5, 5, 10), (-5, 5, 10)]
+    uniform token subdivisionScheme = "catmullClark"
+    rel material:binding = </cube/MatBase>
+
+    def GeomSubset "relief" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [1]
+        rel material:binding = </cube/MatRelief>
+    }
+
+    def GeomSubset "flat" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [3]
+        rel material:binding = </cube/MatFlat>
+    }
+
+    def Material "MatBase"
+    {
+        token outputs:surface.connect = </cube/MatBase/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_gradient"
+            token outputs:out
+        }
+    }
+
+    def Material "MatRelief"
+    {
+        token outputs:surface.connect = </cube/MatRelief/Surface.outputs:out>
+        token outputs:displacement.connect = </cube/MatRelief/Disp.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_spectrum"
+            token outputs:out
+        }
+
+        def Shader "Disp"
+        {
+            uniform token info:id = "printman_test_disp"
+            float inputs:printman:maxMagnitude = 0.3
+            token outputs:out
+        }
+    }
+
+    def Material "MatFlat"
+    {
+        token outputs:surface.connect = </cube/MatFlat/Surface.outputs:out>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "printman_uv"
+            token outputs:out
+        }
+    }
+}

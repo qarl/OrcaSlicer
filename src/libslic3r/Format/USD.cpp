@@ -27,6 +27,7 @@
 #include <pxr/usd/usdGeom/gprim.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/sphere.h>
+#include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/primvar.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
@@ -238,6 +239,9 @@ struct NamedMesh
     bool                                color_object_space  = false;
     bool                                color_dither        = false;
     bool                                color_all_filaments = false;
+    // Region materials beyond the prim's own (material 0, the scalar fields above): materials bound by
+    // UsdGeomSubset face regions, selected per control face by `cage->face_material`. Empty = single material.
+    std::vector<PrintMan::MaterialShaders> extra_materials;
 };
 
 // Why the counters exist: every reason a mesh is skipped has to reach the user.
@@ -400,28 +404,15 @@ PrintMan::SubdivCage read_subdiv_cage(const UsdGeomMesh &mesh, UsdTimeCode when,
     return sc;
 }
 
-// The OSL shaders bound to a prim, resolved through its UsdShade material exactly as USD models shading:
-// the material's `surface` and `displacement` terminal outputs each connect to a Shader prim whose info:id
-// names a compiled OSL shader (.oso on the searchpath). One shader may back both terminals. Colour behaviour
-// (objectSpace / dither / allFilaments) and the displacement clamp (maxMagnitude) are PrintMan slicer
-// directives, not OSL parameters, so they are authored under the printman: input namespace (inputs:printman:*)
-// to keep them from colliding with a real shader parameter of the same name. All fields are empty/zero when
-// the prim carries no material binding.
-struct PrintManMaterial {
-    std::string surface;
-    std::string displacement;
-    double      max_displacement = 0.0;
-    bool        object_space  = false;
-    bool        dither        = false;
-    bool        all_filaments = false;
-};
-
-PrintManMaterial read_printman_material(const UsdPrim &prim, UsdTimeCode when)
+// The OSL shaders of a resolved UsdShade material, exactly as USD models shading: the material's `surface`
+// and `displacement` terminal outputs each connect to a Shader prim whose info:id names a compiled OSL shader
+// (.oso on the searchpath). One shader may back both terminals. Colour behaviour (objectSpace / dither /
+// allFilaments) and the displacement clamp (maxMagnitude) are PrintMan slicer directives, not OSL parameters,
+// so they are authored under the printman: input namespace (inputs:printman:*) to keep them from colliding
+// with a real shader parameter of the same name.
+static PrintMan::MaterialShaders read_material_shaders(const UsdShadeMaterial &mat, UsdTimeCode when)
 {
-    PrintManMaterial pm;
-    const UsdShadeMaterial mat = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
-    if (! mat)
-        return pm;
+    PrintMan::MaterialShaders pm;
     // surface terminal -> colour shader + its colour hints
     if (const UsdShadeShader s = mat.ComputeSurfaceSource()) {
         TfToken id;
@@ -440,6 +431,64 @@ PrintManMaterial read_printman_material(const UsdPrim &prim, UsdTimeCode when)
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:maxMagnitude"))) { in.Get(&m, when); pm.max_displacement = m; }
     }
     return pm;
+}
+
+// The OSL shaders bound to a prim through its own material binding (UsdShade); empty/zero if the prim carries
+// no binding. The mesh's whole-surface material; a face region's material is resolved from its GeomSubset.
+PrintMan::MaterialShaders read_printman_material(const UsdPrim &prim, UsdTimeCode when)
+{
+    const UsdShadeMaterial mat = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
+    return mat ? read_material_shaders(mat, when) : PrintMan::MaterialShaders{};
+}
+
+// Region materials: a UsdGeomSubset of elementType "face" that binds its own material paints + displaces
+// that face region in a different shader than the rest of the mesh. Fills `face_material` (per control face;
+// 0 = the mesh's own material `mesh_mat`, k>=1 = extra_materials[k-1]) and appends the region materials to
+// `extra_materials`. Materials are deduplicated by their bound Material prim path, and a subset re-binding the
+// mesh's own material maps back to 0. Faces in no subset stay 0. No face subsets -> face_material stays empty,
+// so the cage prints as a single material (byte-identical to the pre-subset path). nfaces is the control-face
+// count; subset face indices are into that same authored faceVertexCounts order, which is exactly the core's
+// per-control-face material tag (ctag). Only meaningful on the amplify path (a deferred cage).
+static void read_face_subset_materials(const UsdGeomMesh &mesh, UsdTimeCode when, int nfaces,
+                                       std::vector<int> &face_material,
+                                       std::vector<PrintMan::MaterialShaders> &extra_materials)
+{
+    const std::vector<UsdGeomSubset> subsets = UsdGeomSubset::GetAllGeomSubsets(mesh);
+    if (subsets.empty())
+        return;
+    // The mesh's own bound material prim maps to 0, so a subset re-binding it deduplicates to material 0.
+    std::map<std::string, int> mat_index;
+    if (const UsdShadeMaterial m0 = UsdShadeMaterialBindingAPI(mesh.GetPrim()).ComputeBoundMaterial())
+        mat_index[m0.GetPath().GetString()] = 0;
+    std::vector<int> fm;   // allocated lazily -- stays empty (single material) until a subset overrides a face
+    for (const UsdGeomSubset &subset : subsets) {
+        TfToken elem;
+        if (! subset.GetElementTypeAttr().Get(&elem, when) || elem != UsdGeomTokens->face)
+            continue;   // only a face subset selects a material region
+        const UsdShadeMaterial sm = UsdShadeMaterialBindingAPI(subset.GetPrim()).ComputeBoundMaterial();
+        if (! sm)
+            continue;   // a subset with no material binding repaints nothing
+        const std::string key = sm.GetPath().GetString();
+        int mi;
+        if (const auto it = mat_index.find(key); it != mat_index.end())
+            mi = it->second;
+        else {
+            mi = int(extra_materials.size()) + 1;
+            extra_materials.push_back(read_material_shaders(sm, when));   // sm already resolved above
+            mat_index[key] = mi;
+        }
+        if (mi == 0)
+            continue;   // this subset re-binds the mesh's own material: no per-face override needed
+        if (fm.empty())
+            fm.assign(nfaces, 0);
+        VtIntArray idx;
+        subset.GetIndicesAttr().Get(&idx, when);
+        for (const int f : idx)
+            if (f >= 0 && f < nfaces)
+                fm[f] = mi;
+    }
+    if (! fm.empty())
+        face_material = std::move(fm);
 }
 
 // amplify defers a subdivision cage to slice time (emits the control mesh + a SubdivCage); without it
@@ -726,13 +775,20 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
             // Disp), with colour hints and the displacement clamp read as inputs on those shaders. Carried to
             // the scene and applied at slice time when the build links OSL (ignored otherwise). Only meaningful
             // for a deferred cage (the amplify path).
-            PrintManMaterial pm;
-            if (deferred_cage)
+            PrintMan::MaterialShaders               pm;
+            std::vector<PrintMan::MaterialShaders>  extra_materials;
+            if (deferred_cage) {
                 pm = read_printman_material(mesh.GetPrim(), when);
+                // A UsdGeomSubset may bind a different material to a face region -- per-control-face material
+                // tags (material 0 = pm, k>=1 = extra_materials[k-1]) on the cage, so each region slices in
+                // its own shader. Empty face_material -> single material, the pre-subset path unchanged.
+                read_face_subset_materials(mesh, when, int(deferred_cage->face_counts.size()),
+                                           deferred_cage->face_material, extra_materials);
+            }
 
             out.push_back({prim.GetPath().GetString(), std::move(its), std::move(deferred_cage),
                            cage_xform, pm.surface, pm.displacement, pm.max_displacement,
-                           pm.object_space, pm.dither, pm.all_filaments});
+                           pm.object_space, pm.dither, pm.all_filaments, std::move(extra_materials)});
             ++ mesh_count;
 
             // Counted only once the mesh is actually emitted. Counting it at the
@@ -1276,6 +1332,7 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
             scene.color_object_space   = m.color_object_space;   // colour-shader hints from the prim
             scene.color_dither         = m.color_dither;
             scene.color_all_filaments  = m.color_all_filaments;
+            scene.extra_materials      = std::move(m.extra_materials);   // region materials (cage->face_material selects)
             add_scene_volume(model, object, m.name, path, std::move(scene));
         } else {
             ModelVolume *volume = object->add_volume(TriangleMesh(std::move(m.its)));
