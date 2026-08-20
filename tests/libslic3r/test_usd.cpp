@@ -2778,4 +2778,77 @@ TEST_CASE("A self-contained .usdz slices from its bundled shaders and maps", "[u
     PrintMan::OslDisplaceShader builtin_fallback(combined, "printman_spectrum");   // built-in, not bundled
     CHECK(builtin_fallback.has_color());
 }
+
+// The grid shader on sphere instances, with the shader ENCODED IN THE USD so there is no locating trouble.
+// instanced_grid_spheres.usdz bundles a UV-sphere Catmull-Clark prototype -- instanced twice, 120mm apart --
+// that binds printman_grid on both surface and displacement, plus the compiled printman_grid.oso itself. The
+// loader extracts the bundled shader to a searchpath, the importer carries it onto the instanced scene, and
+// slicing with the bundled shader raises the world-space grid lattice on the sphere instances. This ties
+// together instancing shading + a self-contained .usdz: an instanced shaded model that slices from its own
+// bundle, nothing on the build-time shader path.
+TEST_CASE("The grid shader rides bundled in a .usdz onto sphere instances", "[usd][printman][osl][usdz][instancing]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("instanced_grid_spheres.usdz").c_str(), &model, message, nullptr, /*amplify=*/true));
+    REQUIRE(! model.objects.empty());
+    REQUIRE(! model.objects.front()->volumes.empty());
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    const auto &sc = *vol->printman_scene;
+
+    // The grid shader rode onto the instanced scene from inside the prototype (surface + displacement), and
+    // the stage is genuinely instanced: one sphere prototype, two placements.
+    CHECK(sc.osl_surface_shader      == "printman_grid");
+    CHECK(sc.osl_displacement_shader == "printman_grid");
+    CHECK(sc.osl_max_displacement    == Catch::Approx(8.0));
+    REQUIRE(sc.placements.size() == 2);   // gates the slice below -- a regressed cage import fails here first
+    REQUIRE(sc.prototypes.size() == 1);
+    REQUIRE(sc.cages.size()      == 1);
+
+    // The bundled printman_grid.oso was extracted to a real searchpath (not the built-in dir).
+    REQUIRE_FALSE(sc.osl_shader_searchpath.empty());
+    const std::filesystem::path dir(sc.osl_shader_searchpath);
+    REQUIRE(std::filesystem::is_directory(dir));
+    CHECK(std::filesystem::exists(dir / "printman_grid.oso"));
+
+    // The bundled shader loads from that searchpath and carries both a displacement and a colour output.
+    auto grid = std::make_shared<PrintMan::OslDisplaceShader>(sc.osl_shader_searchpath, "printman_grid");
+    CHECK(grid->has_color());
+
+    // End to end: slice the instanced spheres with the bundled grid displacement and confirm the raised
+    // lattice changes the geometry (a raised grid grows the sliced area outward). Same scene sliced plain is
+    // the control. A modest equatorial band keeps the OSL slice quick.
+    const Transform3d m = vol->get_matrix();
+    float zmin = std::numeric_limits<float>::infinity(), zmax = -zmin;
+    for (const Vec3f &v : vol->mesh().its.vertices) {
+        const float z = float((m * v.cast<double>()).z());
+        zmin = std::min(zmin, z); zmax = std::max(zmax, z);
+    }
+    std::vector<float> zs;
+    const float z0 = zmin + 0.35f * (zmax - zmin), z1 = zmin + 0.65f * (zmax - zmin);
+    for (float z = z0; z < z1; z += 2.0f) zs.push_back(z);
+    REQUIRE(zs.size() > 4);
+    MeshSlicingParamsEx params; params.trafo = m; params.subdiv_tol = 0.08;
+
+    PrintMan::DisplacementField field;
+    field.max_magnitude = sc.osl_max_displacement;
+    field.eval_d = [grid](const PrintMan::V3 &p, const PrintMan::V3 &n, const PrintMan::V3 &dpdx,
+                          const PrintMan::V3 &dpdy, double u, double v) { return (*grid)(p, n, dpdx, dpdy, u, v); };
+
+    auto total_area = [](const std::vector<ExPolygons> &layers) {
+        double a = 0.0;
+        for (const ExPolygons &layer : layers)
+            for (const ExPolygon &ep : layer) a += ep.area();
+        return a;
+    };
+    const std::vector<ExPolygons> plain    = PrintMan::slice_scene(sc, params, zs);
+    const std::vector<ExPolygons> gridded  = PrintMan::slice_scene(sc, params, zs, [](){}, {}, field);
+    REQUIRE(plain.size()   == zs.size());
+    REQUIRE(gridded.size() == zs.size());
+    const double a_plain = total_area(plain), a_grid = total_area(gridded);
+    INFO("a_plain=" << a_plain << "  a_grid=" << a_grid);
+    REQUIRE(a_plain > 0.0);
+    CHECK(a_grid > a_plain);                              // the raised lattice grows the spheres outward
+    CHECK(std::abs(a_grid - a_plain) > 0.002 * a_plain);  // by a measurable amount, not slice noise
+}
 #endif // SLIC3R_OSL

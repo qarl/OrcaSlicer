@@ -1,0 +1,67 @@
+#usda 1.0
+(
+    metersPerUnit = 0.001
+    upAxis = "Z"
+)
+
+# Source for instanced_grid_spheres.usdz (pack with:
+#   scripts/printman_pack_usdz.py tests/data/test_usd/instanced_grid_spheres.usda \
+#       tests/data/test_usd/instanced_grid_spheres.usdz printman_grid.oso
+# -- the .oso is passed explicitly as a bundle file because the packer's stage.Traverse() does not descend
+#  into an instanced prototype to auto-discover its bound shader).
+#
+# Two instances of ONE UV-sphere Catmull-Clark prototype, each carrying the printman_grid shader on BOTH the
+# surface (Cout: red ribs / blue grooves) and displacement (Disp: a raised world-space lattice). The lattice
+# is a function of world position, so each sphere -- 125mm apart in X, not a whole multiple of the 1.5mm
+# lattice pitch -- wears the grid at a different phase. The grid shader is bundled INTO the .usdz, so the model
+# needs nothing on the build-time shader path to slice.
+def "Prototypes"
+{
+    class Xform "Proto"
+    {
+        def Mesh "Ball" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+            int[] faceVertexIndices = [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5, 0, 5, 6, 0, 6, 7, 0, 7, 8, 0, 8, 9, 0, 9, 10, 0, 10, 11, 0, 11, 12, 0, 12, 1, 1, 13, 14, 2, 2, 14, 15, 3, 3, 15, 16, 4, 4, 16, 17, 5, 5, 17, 18, 6, 6, 18, 19, 7, 7, 19, 20, 8, 8, 20, 21, 9, 9, 21, 22, 10, 10, 22, 23, 11, 11, 23, 24, 12, 12, 24, 13, 1, 13, 25, 26, 14, 14, 26, 27, 15, 15, 27, 28, 16, 16, 28, 29, 17, 17, 29, 30, 18, 18, 30, 31, 19, 19, 31, 32, 20, 20, 32, 33, 21, 21, 33, 34, 22, 22, 34, 35, 23, 23, 35, 36, 24, 24, 36, 25, 13, 25, 37, 38, 26, 26, 38, 39, 27, 27, 39, 40, 28, 28, 40, 41, 29, 29, 41, 42, 30, 30, 42, 43, 31, 31, 43, 44, 32, 32, 44, 45, 33, 33, 45, 46, 34, 34, 46, 47, 35, 35, 47, 48, 36, 36, 48, 37, 25, 37, 49, 50, 38, 38, 50, 51, 39, 39, 51, 52, 40, 40, 52, 53, 41, 41, 53, 54, 42, 42, 54, 55, 43, 43, 55, 56, 44, 44, 56, 57, 45, 45, 57, 58, 46, 46, 58, 59, 47, 47, 59, 60, 48, 48, 60, 49, 37, 61, 50, 49, 61, 51, 50, 61, 52, 51, 61, 53, 52, 61, 54, 53, 61, 55, 54, 61, 56, 55, 61, 57, 56, 61, 58, 57, 61, 59, 58, 61, 60, 59, 61, 49, 60]
+            point3f[] points = [(0, 0, 76), (20, 0, 70.641), (17.3205, 10, 70.641), (10, 17.3205, 70.641), (1.22465e-15, 20, 70.641), (-10, 17.3205, 70.641), (-17.3205, 10, 70.641), (-20, 2.44929e-15, 70.641), (-17.3205, -10, 70.641), (-10, -17.3205, 70.641), (-3.67394e-15, -20, 70.641), (10, -17.3205, 70.641), (17.3205, -10, 70.641), (34.641, 0, 56), (30, 17.3205, 56), (17.3205, 30, 56), (2.12115e-15, 34.641, 56), (-17.3205, 30, 56), (-30, 17.3205, 56), (-34.641, 4.2423e-15, 56), (-30, -17.3205, 56), (-17.3205, -30, 56), (-6.36345e-15, -34.641, 56), (17.3205, -30, 56), (30, -17.3205, 56), (40, 0, 36), (34.641, 20, 36), (20, 34.641, 36), (2.44929e-15, 40, 36), (-20, 34.641, 36), (-34.641, 20, 36), (-40, 4.89859e-15, 36), (-34.641, -20, 36), (-20, -34.641, 36), (-7.34788e-15, -40, 36), (20, -34.641, 36), (34.641, -20, 36), (34.641, 0, 16), (30, 17.3205, 16), (17.3205, 30, 16), (2.12115e-15, 34.641, 16), (-17.3205, 30, 16), (-30, 17.3205, 16), (-34.641, 4.2423e-15, 16), (-30, -17.3205, 16), (-17.3205, -30, 16), (-6.36345e-15, -34.641, 16), (17.3205, -30, 16), (30, -17.3205, 16), (20, 0, 1.35898), (17.3205, 10, 1.35898), (10, 17.3205, 1.35898), (1.22465e-15, 20, 1.35898), (-10, 17.3205, 1.35898), (-17.3205, 10, 1.35898), (-20, 2.44929e-15, 1.35898), (-17.3205, -10, 1.35898), (-10, -17.3205, 1.35898), (-3.67394e-15, -20, 1.35898), (10, -17.3205, 1.35898), (17.3205, -10, 1.35898), (0, 0, -4)]
+            uniform token subdivisionScheme = "catmullClark"
+            rel material:binding = </Prototypes/Proto/Ball/Grid>
+
+            def Material "Grid"
+            {
+                token outputs:surface.connect = </Prototypes/Proto/Ball/Grid/Shader.outputs:out>
+                token outputs:displacement.connect = </Prototypes/Proto/Ball/Grid/Shader.outputs:out>
+
+                def Shader "Shader"
+                {
+                    uniform token info:id = "printman_grid"
+                    float inputs:printman:maxMagnitude = 8
+                    token outputs:out
+                }
+            }
+        }
+    }
+}
+
+def "Root"
+{
+    def Xform "ball_000" (
+        prepend inherits = </Prototypes/Proto>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "ball_001" (
+        prepend inherits = </Prototypes/Proto>
+        instanceable = true
+    )
+    {
+        double3 xformOp:translate = (125, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}
