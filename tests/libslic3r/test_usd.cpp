@@ -2163,6 +2163,46 @@ TEST_CASE("solver_dither picks filaments by the solver's Kubelka-Munk weights", 
     CHECK(green_n <= blue_n);                     // green is the least-used
 }
 
+// End to end at the engine level: when a ColorField carries a solver, slice_scene classifies each refined
+// face through it during a real slice. A red-everywhere shader over a red/green/blue palette deposits its
+// colour into the red channel and (essentially) nothing into green/blue -- proving Engine.cpp routes through
+// solver_dither in situ, not just that solver_dither works in isolation. No OSL: a C++ eval stands in.
+TEST_CASE("slice_scene routes colour through the KM solver when one is set", "[colorsolver][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    const ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    const PrintMan::PrintManScene &scene = *vol->printman_scene;
+
+    PrintMan::ColorField color;
+    color.palette = {FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 255, 0), FlushPredict::RGBColor(0, 0, 255)};
+    color.solver = std::make_shared<const Slic3r::ImageMap::ContinuousColorSolver>(
+        std::vector<Slic3r::ImageMap::ContinuousColorComponent>{
+            {"#FF0000", std::nullopt, std::nullopt}, {"#00FF00", std::nullopt, std::nullopt}, {"#0000FF", std::nullopt, std::nullopt}});
+    REQUIRE(color.solver->valid());
+    color.eval = [](const PrintMan::V3 &, const PrintMan::V3 &, const PrintMan::V3 &,
+                    const PrintMan::V3 &, double, double) { return PrintMan::V3{{1.0, 0.0, 0.0}}; };   // red
+
+    const Transform3d m = vol->get_matrix();
+    std::vector<float> zs; for (float z = 0.5f; z < 9.5f; z += 0.5f) zs.push_back(z);
+    MeshSlicingParamsEx params; params.trafo = m; params.subdiv_tol = 0.1;
+    std::vector<std::vector<ExPolygons>> seg;   // [layer][channel]
+    PrintMan::slice_scene(scene, params, zs, [](){}, {}, PrintMan::DisplacementField{}, color, &seg);
+
+    // Sum each channel across layers (seg is per-layer, per-channel).
+    auto channel_area = [&](size_t k) {
+        double a = 0.0;
+        for (const std::vector<ExPolygons> &layer : seg)
+            if (k < layer.size()) for (const ExPolygon &e : layer[k]) a += e.area();
+        return a;
+    };
+    const double red = channel_area(0), green = channel_area(1), blue = channel_area(2);
+    INFO("channel areas: red=" << red << " green=" << green << " blue=" << blue);
+    CHECK(red > 0.0);                                  // the red-everywhere shader coloured the red channel
+    CHECK(green + blue < 0.02 * red);                  // ~nothing on green/blue -> the solver classified red
+}
+
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
 // cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +
