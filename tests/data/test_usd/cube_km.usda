@@ -7,14 +7,16 @@
 # A subdivision cube whose surface material opts into Kubelka-Munk colour classification via
 # bool inputs:printman:colorKM. The importer reads it onto PrintManScene::color_km, which makes the slicer
 # resolve the shader's colour to a real filament mix with the vendored FullSpectrum solver instead of the
-# built-in linear-RGB dither. (Read side only -- asserts the hint reaches the scene, not the shading.)
+# built-in linear-RGB dither. objectSpace spans the magenta->cyan gradient over the whole object so both
+# filaments appear. Drives two tests: the read-side hint check, and the process() capstone that confirms the
+# KM solver classifies the gradient into the sliced per-filament regions through the full app pipeline.
 def Mesh "cube" (
     prepend apiSchemas = ["MaterialBindingAPI"]
 )
 {
     int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
     int[] faceVertexIndices = [0, 3, 2, 1, 4, 5, 6, 7, 0, 1, 5, 4, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
-    point3f[] points = [(-5, -5, 0), (5, -5, 0), (5, 5, 0), (-5, 5, 0), (-5, -5, 10), (5, -5, 10), (5, 5, 10), (-5, 5, 10)]
+    point3f[] points = [(-10, -10, 0), (10, -10, 0), (10, 10, 0), (-10, 10, 0), (-10, -10, 40), (10, -10, 40), (10, 10, 40), (-10, 10, 40)]
     uniform token subdivisionScheme = "catmullClark"
     rel material:binding = </cube/Material>
 
@@ -26,6 +28,7 @@ def Mesh "cube" (
         {
             uniform token info:id = "printman_gradient"
             bool inputs:printman:colorKM = true
+            bool inputs:printman:objectSpace = true   // span the gradient over the object so both filaments appear
             token outputs:out
         }
     }

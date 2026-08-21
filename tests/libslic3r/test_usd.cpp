@@ -3112,4 +3112,77 @@ TEST_CASE("An authored colour shader parameter reaches the OSL shader", "[usd][p
     CHECK(c1[0] > 0.9);   // forced red: the Bottom/Top colour params reached the shader
     CHECK(c1[1] < 0.1);
 }
+
+// Full-pipeline capstone: printman:colorKM drives Kubelka-Munk classification all the way through process().
+// cube_km.usda binds printman_gradient (magenta->cyan, object-space) with colorKM=true, so the importer sets
+// scene.color_km, PrintObjectSlice builds the vendored solver over the loaded {magenta, cyan} filaments, and
+// the engine classifies each face to a KM mix. The discriminator vs the plain linear-RGB dither is the SHAPE
+// of the cyan distribution up the object: the KM solver snaps to the nearest physical filament (a hard
+// one-hot) so cyan is *absent* through the magenta base and appears only where the gradient crosses toward
+// cyan; the dither instead speckles a little cyan everywhere (the sibling gradient test at "colours the whole
+// object through process()" asserts cyan_bottom > 0.0 for exactly that reason). So cyan_bottom == 0.0 is the
+// assertion that passes for KM and would fail for the dither -- it is what proves the solver, not the dither,
+// ran the whole way through the real app path, activated by the USD hint (not the env override).
+SCENARIO_METHOD(UsdResourcesFixture, "printman:colorKM drives the KM solver through process()", "[usd][printman][color][osl][colorsolver]")
+{
+    ::unsetenv("PRINTMAN_DEBUG_COLOR");
+    ::unsetenv("PRINTMAN_KM");                          // rely on the USD hint, not the env override
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_km.usda").c_str(), &model, message, nullptr, true));
+    ModelVolume *vol = model.objects.front()->volumes.front();
+    REQUIRE(vol->printman_scene.has_value());
+    REQUIRE(vol->printman_scene->color_km);            // the hint reached the scene
+    vol->printman_scene->filaments = {1, 2};
+    model.add_default_instances();
+    model.center_instances_around_point(Vec2d(125.0, 125.0));
+
+    DynamicPrintConfig config;
+    config.apply(FullPrintConfig::defaults());
+    config.set_key_value("filament_diameter", new ConfigOptionFloats(std::vector<double>{1.75, 1.75}));
+    config.set_key_value("filament_colour",   new ConfigOptionStrings(std::vector<std::string>{"#FF00FF", "#00FFFF"}));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+
+    Print print;
+    print.apply(model, config);
+    REQUIRE(! print.objects().empty());
+    // process() slices + segments the whole object; gcode export then trips the same "empty first layer"
+    // printability quirk the plain-gradient process() test hits (a catmullClark cube's limit surface lifts its
+    // bottom face off the bed), so -- exactly as that test does -- we tolerate the export throw and verify the
+    // slice/segmentation result: the KM path having produced the per-filament regions is the thing under test.
+    try { print.process(); } catch (const std::exception &e) { WARN("process() threw: " << e.what()); }
+
+    const PrintObject *po = print.objects().front();
+    REQUIRE(po->num_printing_regions() == 2);          // KM classified the object into base+magenta and cyan regions
+    const auto &layers = po->layers();
+    REQUIRE(layers.size() > 10);
+    auto region_area = [](const Layer *ly, size_t i) {
+        double a = 0.0;
+        if (i < size_t(ly->region_count()))
+            for (const Surface &s : ly->get_region(int(i))->slices.surfaces)
+                a += s.expolygon.area();
+        return a;
+    };
+    // Cyan (region 1) area per height-fifth. The magenta->cyan object-space gradient, resolved to filaments by
+    // the vendored Kubelka-Munk solver (not the linear-RGB dither), reaches the sliced per-filament regions as
+    // a hard one-hot: NO cyan through the magenta base, cyan only toward the top. That base-zero is the KM
+    // signature threaded through the full app pipeline (the dither would speckle cyan through the base instead).
+    const int NB = 5;
+    double cyan[NB] = {0}, base[NB] = {0};
+    const size_t nL = layers.size();
+    for (size_t li = 0; li < nL; ++ li) {
+        const int b = std::min(NB - 1, int(li * NB / nL));
+        base[b] += region_area(layers[li], 0);
+        cyan[b] += region_area(layers[li], 1);
+    }
+    for (int b = 0; b < NB; ++ b) {
+        const double tot = base[b] + cyan[b];
+        WARN("height fifth " << b << " cyan_area=" << cyan[b] << " cyan_share=" << (tot > 0 ? cyan[b] / tot : 0.0));
+    }
+    const double cyan_bottom = cyan[0] + cyan[1], cyan_top = cyan[NB - 2] + cyan[NB - 1];
+    REQUIRE(cyan_top    > 0.0);                         // the KM colour path is live: cyan appears toward the top
+    REQUIRE(cyan_bottom == 0.0);                        // and is ABSENT through the magenta base -- the KM hard
+                                                        // one-hot signature; the linear dither would speckle
+                                                        // cyan here (sibling test asserts cyan_bottom > 0.0), so
+                                                        // this is the assertion that fails for dither, passes for KM.
+}
 #endif // SLIC3R_OSL
