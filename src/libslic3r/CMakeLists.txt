@@ -569,6 +569,9 @@ if (NOT TARGET usd_m)
 endif ()
 set_target_properties(usd_m PROPERTIES IMPORTED_GLOBAL TRUE)
 target_sources(libslic3r PRIVATE Format/USD.cpp Format/USD.hpp)
+# The FullSpectrum colour->filament solver (Kubelka-Munk / ICC), vendored to classify a shader's Cout per
+# refined face; pure colour maths, no USD/OSL dependency, so compiled unconditionally.
+target_sources(libslic3r PRIVATE ContinuousColorSolver.cpp FullSpectrumKSPairResidual.cpp FullSpectrumICCPolynomialEstimator.cpp)
 
 target_link_libraries(libslic3r PRIVATE usd_m)
 

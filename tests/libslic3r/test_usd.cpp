@@ -16,6 +16,7 @@
 #include "libslic3r/Format/USDSubdiv.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/ContinuousColorSolver.hpp"   // vendored FullSpectrum colour->filament solver
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ModelArrange.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -2092,6 +2093,37 @@ TEST_CASE("An instanced shaded prototype carries its shader and displaces per pl
     REQUIRE(near_top >= 0);
     REQUIRE(far_top  >= 0);
     CHECK(far_top > near_top + 4);      // the far instance rose well above the near one -- per-placement wind
+}
+
+// The vendored FullSpectrum colour solver functions: built from three physical filaments, solve() resolves a
+// target RGB to a weight vector over those filaments. Solving for a filament's OWN colour must weight that
+// filament highest; a magenta target (red+blue) must weigh green least. This is path A's engine -- PrintMan
+// will call solve(Cout) per refined face and realise the weights with its own dither.
+TEST_CASE("The vendored FullSpectrum colour solver resolves a target to filament weights", "[colorsolver][printman]")
+{
+    using Slic3r::ImageMap::ContinuousColorSolver;
+    using Slic3r::ImageMap::ContinuousColorComponent;
+    std::vector<ContinuousColorComponent> comps = {
+        {"#FF0000", std::nullopt, std::nullopt},   // red
+        {"#00FF00", std::nullopt, std::nullopt},   // green
+        {"#0000FF", std::nullopt, std::nullopt},   // blue
+    };
+    ContinuousColorSolver solver(std::move(comps));
+    REQUIRE(solver.valid());
+    REQUIRE(solver.component_count() == 3);
+    auto solve = [&](float r, float g, float b) { return solver.solve(Slic3r::RGBA{{r, g, b, 1.f}}); };
+
+    const std::vector<double> wr = solve(1.f, 0.f, 0.f);   // pure red
+    REQUIRE(wr.size() == 3);
+    CHECK(wr[0] > wr[1]);
+    CHECK(wr[0] > wr[2]);                                  // red filament dominates for a red target
+    const std::vector<double> wb = solve(0.f, 0.f, 1.f);   // pure blue
+    CHECK(wb[2] > wb[0]);
+    CHECK(wb[2] > wb[1]);                                  // blue filament dominates for a blue target
+    const std::vector<double> wm = solve(1.f, 0.f, 1.f);   // magenta = red + blue
+    INFO("magenta weights r=" << wm[0] << " g=" << wm[1] << " b=" << wm[2]);
+    CHECK(wm[1] <= wm[0]);
+    CHECK(wm[1] <= wm[2]);                                 // green is the least-used filament for magenta
 }
 
 #ifdef SLIC3R_OSL
