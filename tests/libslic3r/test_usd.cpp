@@ -2203,6 +2203,23 @@ TEST_CASE("slice_scene routes colour through the KM solver when one is set", "[c
     CHECK(green + blue < 0.02 * red);                  // ~nothing on green/blue -> the solver classified red
 }
 
+// build_palette_solver constructs a solver over the loaded filament palette in order, so a red target hits
+// filament 0 and blue hits filament 2 -- exactly what PrintObjectSlice needs to hand the engine. A palette too
+// small to mix (< 2) returns null, so the caller cleanly falls back to the built-in dither.
+TEST_CASE("build_palette_solver builds a KM solver over the loaded palette in order", "[colorsolver][printman]")
+{
+    using Slic3r::PrintMan::V3;
+    const std::vector<FlushPredict::RGBColor> palette = {
+        FlushPredict::RGBColor(255, 0, 0), FlushPredict::RGBColor(0, 255, 0), FlushPredict::RGBColor(0, 0, 255)};
+    auto solver = Slic3r::PrintMan::build_palette_solver(palette);
+    REQUIRE(solver);
+    REQUIRE(solver->valid());
+    REQUIRE(solver->component_count() == 3);
+    CHECK(Slic3r::PrintMan::solver_dither(*solver, V3{{1.0, 0.0, 0.0}}, 0.3) == 0);   // red -> filament 0
+    CHECK(Slic3r::PrintMan::solver_dither(*solver, V3{{0.0, 0.0, 1.0}}, 0.3) == 2);   // blue -> filament 2
+    CHECK_FALSE(Slic3r::PrintMan::build_palette_solver({FlushPredict::RGBColor(255, 0, 0)}));   // <2 -> null
+}
+
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
 // cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +

@@ -9,6 +9,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "libslic3r/FlushVolPredictor.hpp"   // FlushPredict::RGBColor, calc_color_distance (DeltaE2000)
@@ -139,6 +143,24 @@ inline int solver_dither(const ImageMap::ContinuousColorSolver &solver, const V3
     double acc = 0.0;
     for (int i = 0; i < int(w.size()); ++i) { acc += w[i]; if (d01 < acc) return i; }
     return int(w.size()) - 1;
+}
+
+// Build a Kubelka-Munk solver over the loaded palette, IN palette order so weight i is filament i (what
+// solver_dither expects). The solver takes hex colours; the palette holds sRGB bytes, encoded here. Returns
+// null if the palette is too small for a mix (< 2 colours) or the solver fails to prepare, so the caller
+// falls back to the built-in dither.
+inline std::shared_ptr<const ImageMap::ContinuousColorSolver>
+build_palette_solver(const std::vector<FlushPredict::RGBColor> &palette)
+{
+    std::vector<ImageMap::ContinuousColorComponent> comps;
+    comps.reserve(palette.size());
+    for (const FlushPredict::RGBColor &c : palette) {
+        char hex[8];
+        std::snprintf(hex, sizeof(hex), "#%02X%02X%02X", c.r, c.g, c.b);
+        comps.push_back({std::string(hex), std::nullopt, std::nullopt});
+    }
+    auto solver = std::make_shared<const ImageMap::ContinuousColorSolver>(std::move(comps));
+    return solver->valid() ? solver : nullptr;
 }
 
 }}  // namespace Slic3r::PrintMan

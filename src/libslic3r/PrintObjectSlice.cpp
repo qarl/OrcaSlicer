@@ -18,6 +18,8 @@
 #include <memory>
 #include <optional>
 #include "PrintMan/OslShader.hpp"
+#include "PrintMan/Palette.hpp"   // build_palette_solver (Kubelka-Munk classifier)
+#include <cstdlib>                 // getenv (PRINTMAN_KM opt-in)
 #endif
 
 //! macro used to mark string used at localization, return same string
@@ -210,6 +212,13 @@ static std::vector<ExPolygons> slice_volume(
                         // band_width is just the deposition ribbon; wall_depth (set above) is what claims the
                         // outer-wall shell, so the colour owns the printed wall on a curve as well as a flat face.
                         color.dither = volume.printman_scene->color_dither;
+                        // Opt-in Kubelka-Munk classification (PRINTMAN_KM env for now; a printman:colorKM USD
+                        // hint is the intended per-model switch): resolve each face's colour to a real filament
+                        // MIX with the vendored FullSpectrum solver instead of dither_filament's linear-RGB
+                        // area average. build_palette_solver returns null for a palette too small to mix, so
+                        // the engine cleanly falls back to the built-in dither.
+                        if (std::getenv("PRINTMAN_KM"))
+                            color.solver = PrintMan::build_palette_solver(color.palette);
                     }
                 }
 #endif
