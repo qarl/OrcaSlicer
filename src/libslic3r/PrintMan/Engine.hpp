@@ -2,6 +2,7 @@
 #define slic3r_PrintMan_Engine_hpp_
 
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "libslic3r/ExPolygon.hpp"
@@ -12,6 +13,7 @@
 
 namespace Slic3r {
 struct MeshSlicingParamsEx;   // libslic3r/TriangleMeshSlicer.hpp
+namespace ImageMap { class ContinuousColorSolver; }   // vendored FullSpectrum Kubelka-Munk solver
 namespace PrintMan {
 
 // Optional displacement shader for the amplification engine: it moves each refined surface
@@ -36,6 +38,10 @@ struct ColorField {
     double wall_depth  = 0.0;    // mm: depth of the outer-wall shell the colour claims; 0 -> legacy thin-ribbon clip
     bool   dither      = false;  // spatially dither Cout across the two nearest filaments, else hard quantize
     double dither_cell = 0.5;    // mm: dither pattern cell (~ a line width); ignored unless `dither`
+    // When set, dithering resolves the colour with FullSpectrum's Kubelka-Munk solver (a real pigment mix)
+    // instead of the linear-RGB area average; carries the loaded filaments in palette order. Null -> the
+    // built-in dither_filament, so the existing colour path is byte-identical.
+    std::shared_ptr<const ImageMap::ContinuousColorSolver> solver;
     explicit operator bool() const { return bool(eval) && ! palette.empty(); }
 };
 

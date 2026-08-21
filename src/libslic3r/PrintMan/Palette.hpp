@@ -13,6 +13,7 @@
 
 #include "libslic3r/FlushVolPredictor.hpp"   // FlushPredict::RGBColor, calc_color_distance (DeltaE2000)
 #include "libslic3r/PrintMan/Displace.hpp"   // V3
+#include "libslic3r/ContinuousColorSolver.hpp"   // ImageMap::ContinuousColorSolver (Kubelka-Munk mix)
 
 namespace Slic3r { namespace PrintMan {
 
@@ -121,6 +122,23 @@ inline int dither_filament(const V3 &linear_rgb, const std::vector<FlushPredict:
     double acc = 0.0;
     for (int i = 0; i < n; ++i) { acc += w[i]; if (d01 < acc) return i; }
     return n - 1;
+}
+
+// Physically-accurate dither: FullSpectrum's Kubelka-Munk solver resolves the shader's linear-RGB Cout to
+// per-filament weights (a real pigment mix accounting for opacity/transmission, not the linear-light area
+// average dither_filament assumes), then this cell takes the filament whose cumulative weight interval
+// contains the spatial hash d01 -- the same coverage sampling as dither_filament, over KM weights. The solver
+// carries the loaded filaments in palette order, so weight i is filament i. -1 for an unusable solver.
+inline int solver_dither(const ImageMap::ContinuousColorSolver &solver, const V3 &linear_rgb, double d01)
+{
+    const RGBA target{{float(linear_to_srgb8(linear_rgb[0])) / 255.f,
+                       float(linear_to_srgb8(linear_rgb[1])) / 255.f,
+                       float(linear_to_srgb8(linear_rgb[2])) / 255.f, 1.f}};
+    const std::vector<double> w = solver.solve(target);
+    if (w.empty()) return -1;
+    double acc = 0.0;
+    for (int i = 0; i < int(w.size()); ++i) { acc += w[i]; if (d01 < acc) return i; }
+    return int(w.size()) - 1;
 }
 
 }}  // namespace Slic3r::PrintMan

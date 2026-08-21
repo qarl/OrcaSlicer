@@ -327,7 +327,8 @@ static void accumulate_color_bands(const indexed_triangle_set &its, const std::v
         const double su = have_uv ? tri_uv[ti][0] : 0.0;
         const double sv = have_uv ? tri_uv[ti][1] : 0.0;
         const V3  cout = color.eval(centroid, face_normal(a, b, c), e1, e2, su, sv);
-        const int k    = color.dither ? dither_filament(cout, color.palette, dither_hash(centroid, color.dither_cell))
+        const int k    = color.solver ? solver_dither(*color.solver, cout, dither_hash(centroid, color.dither_cell))
+                       : color.dither ? dither_filament(cout, color.palette, dither_hash(centroid, color.dither_cell))
                                       : nearest_filament(cout, color.palette);
         if (k < 0)
             continue;

@@ -17,6 +17,7 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/ContinuousColorSolver.hpp"   // vendored FullSpectrum colour->filament solver
+#include "libslic3r/PrintMan/Palette.hpp"        // solver_dither (KM classifier)
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ModelArrange.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -2124,6 +2125,42 @@ TEST_CASE("The vendored FullSpectrum colour solver resolves a target to filament
     INFO("magenta weights r=" << wm[0] << " g=" << wm[1] << " b=" << wm[2]);
     CHECK(wm[1] <= wm[0]);
     CHECK(wm[1] <= wm[2]);                                 // green is the least-used filament for magenta
+}
+
+// solver_dither turns the solver's KM weights into a per-cell filament pick (the engine's classification
+// step): the cell takes the filament whose cumulative-weight interval contains the spatial hash. A pure-red
+// target picks red every cell; a magenta target splits red/blue across cells and never picks green. Inputs
+// are LINEAR RGB (what a shader's Cout is); solver_dither sRGB-encodes them before solving.
+TEST_CASE("solver_dither picks filaments by the solver's Kubelka-Munk weights", "[colorsolver][printman]")
+{
+    using Slic3r::ImageMap::ContinuousColorSolver;
+    using Slic3r::ImageMap::ContinuousColorComponent;
+    using Slic3r::PrintMan::V3;
+    auto solver = std::make_shared<ContinuousColorSolver>(std::vector<ContinuousColorComponent>{
+        {"#FF0000", std::nullopt, std::nullopt},   // 0 red
+        {"#00FF00", std::nullopt, std::nullopt},   // 1 green
+        {"#0000FF", std::nullopt, std::nullopt},   // 2 blue
+    });
+    REQUIRE(solver->valid());
+
+    // Pure red (linear) -> red filament in the dominant cells.
+    const V3 red{{1.0, 0.0, 0.0}};
+    CHECK(Slic3r::PrintMan::solver_dither(*solver, red, 0.1) == 0);
+    CHECK(Slic3r::PrintMan::solver_dither(*solver, red, 0.5) == 0);
+
+    // Magenta (red + blue) -> cells split red/blue, green stays the minority.
+    const V3 magenta{{1.0, 0.0, 1.0}};
+    int red_n = 0, green_n = 0, blue_n = 0;
+    for (int i = 0; i < 20; ++i) {
+        const int k = Slic3r::PrintMan::solver_dither(*solver, magenta, (i + 0.5) / 20.0);
+        if (k == 0) ++red_n; else if (k == 1) ++green_n; else if (k == 2) ++blue_n;
+    }
+    INFO("magenta cells: red=" << red_n << " green=" << green_n << " blue=" << blue_n);
+    CHECK(red_n > 0);
+    CHECK(blue_n > 0);
+    CHECK(red_n + blue_n >= 14);                 // magenta is carried by red+blue
+    CHECK(green_n <= red_n);
+    CHECK(green_n <= blue_n);                     // green is the least-used
 }
 
 #ifdef SLIC3R_OSL
