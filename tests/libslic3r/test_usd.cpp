@@ -2220,6 +2220,22 @@ TEST_CASE("build_palette_solver builds a KM solver over the loaded palette in or
     CHECK_FALSE(Slic3r::PrintMan::build_palette_solver({FlushPredict::RGBColor(255, 0, 0)}));   // <2 -> null
 }
 
+// The printman:colorKM surface-shader hint threads from the USD material onto PrintManScene::color_km, which
+// is what makes PrintObjectSlice build the KM solver. A material without the hint leaves it off (so the
+// existing linear-RGB dither stays the default). Read side, no OSL needed.
+TEST_CASE("printman:colorKM threads onto the scene as color_km", "[usd][printman][subdiv]")
+{
+    Model model; std::string message;
+    REQUIRE(load_usd(usd_path("cube_km.usda").c_str(), &model, message, nullptr, /*amplify=*/true));
+    REQUIRE(model.objects.front()->volumes.front()->printman_scene.has_value());
+    CHECK(model.objects.front()->volumes.front()->printman_scene->color_km);
+
+    Model plain; std::string msg2;   // cube_catmull carries no material, so the hint stays off
+    REQUIRE(load_usd(usd_path("cube_catmull.usda").c_str(), &plain, msg2, nullptr, /*amplify=*/true));
+    REQUIRE(plain.objects.front()->volumes.front()->printman_scene.has_value());
+    CHECK_FALSE(plain.objects.front()->volumes.front()->printman_scene->color_km);
+}
+
 #ifdef SLIC3R_OSL
 // End-to-end through the REAL OSL gradient shader and the full process() pipeline (not just slice_scene):
 // cube_gradient.usda binds printman_gradient to material:surface with inputs:printman:objectSpace +

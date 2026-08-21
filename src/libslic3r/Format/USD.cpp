@@ -239,6 +239,7 @@ struct NamedMesh
     bool                                color_object_space  = false;
     bool                                color_dither        = false;
     bool                                color_all_filaments = false;
+    bool                                color_km            = false;
     // Authored shader parameters on material 0's surface/displacement shaders (see PrintManScene).
     std::vector<PrintMan::ShaderParam>  surface_params;
     std::vector<PrintMan::ShaderParam>  displacement_params;
@@ -482,6 +483,7 @@ static PrintMan::MaterialShaders read_material_shaders(const UsdShadeMaterial &m
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:objectSpace")))  in.Get(&pm.object_space,  when);
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:dither")))       in.Get(&pm.dither,        when);
         if (const UsdShadeInput in = s.GetInput(TfToken("printman:allFilaments"))) in.Get(&pm.all_filaments, when);
+        if (const UsdShadeInput in = s.GetInput(TfToken("printman:colorKM")))      in.Get(&pm.km,           when);
         pm.surface_params = read_shader_params(s, when);
     }
     // displacement terminal -> relief shader + its clamp + its authored parameters
@@ -859,7 +861,7 @@ bool read_stage(const char *path, std::vector<NamedMesh> &out, std::string &mess
 
             out.push_back({prim.GetPath().GetString(), std::move(its), std::move(deferred_cage),
                            cage_xform, pm.surface, pm.displacement, pm.max_displacement,
-                           pm.object_space, pm.dither, pm.all_filaments,
+                           pm.object_space, pm.dither, pm.all_filaments, pm.km,
                            std::move(pm.surface_params), std::move(pm.displacement_params),
                            std::move(extra_materials)});
             ++ mesh_count;
@@ -1182,6 +1184,7 @@ void build_instance_scene(const UsdStageRefPtr &stage, UsdTimeCode when,
                 scene.osl_max_displacement    = pm.max_displacement;
                 scene.color_object_space      = pm.object_space;
                 scene.color_dither            = pm.dither;
+                scene.color_km                = pm.km;
                 scene.color_all_filaments     = pm.all_filaments;
                 scene.osl_surface_params      = pm.surface_params;
                 scene.osl_displacement_params = pm.displacement_params;
@@ -1441,6 +1444,7 @@ bool load_usd(const char *path, Model *model, std::string &message, const char *
             scene.color_object_space   = m.color_object_space;   // colour-shader hints from the prim
             scene.color_dither         = m.color_dither;
             scene.color_all_filaments  = m.color_all_filaments;
+            scene.color_km             = m.color_km;
             scene.osl_surface_params      = std::move(m.surface_params);       // authored shader parameters
             scene.osl_displacement_params = std::move(m.displacement_params);
             scene.extra_materials      = std::move(m.extra_materials);   // region materials (cage->face_material selects)

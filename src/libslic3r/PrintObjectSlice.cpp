@@ -217,7 +217,7 @@ static std::vector<ExPolygons> slice_volume(
                         // MIX with the vendored FullSpectrum solver instead of dither_filament's linear-RGB
                         // area average. build_palette_solver returns null for a palette too small to mix, so
                         // the engine cleanly falls back to the built-in dither.
-                        if (std::getenv("PRINTMAN_KM"))
+                        if (volume.printman_scene->color_km || std::getenv("PRINTMAN_KM"))
                             color.solver = PrintMan::build_palette_solver(color.palette);
                     }
                 }

@@ -47,6 +47,7 @@ struct MaterialShaders
     bool        object_space  = false;   // printman:objectSpace  -- feed the colour shader an object-normalized Z
     bool        dither        = false;   // printman:dither       -- spatially blend across the two nearest filaments
     bool        all_filaments = false;   // printman:allFilaments -- dither across every loaded filament
+    bool        km            = false;   // printman:colorKM      -- classify via the Kubelka-Munk solver, not the RGB dither
     std::vector<ShaderParam> surface_params;       // authored inputs on the surface shader prim
     std::vector<ShaderParam> displacement_params;  // authored inputs on the displacement shader prim
 };
@@ -126,6 +127,10 @@ struct PrintManScene
     // ids depend on how many filaments are loaded, so they are resolved at apply/slice time (see
     // resolved_filaments), not stored here. Off -> `filaments` above is the literal set.
     bool color_all_filaments = false;
+
+    // When set (printman:colorKM), the surface colour is classified with the vendored FullSpectrum
+    // Kubelka-Munk solver -- a real filament pigment mix -- instead of the built-in linear-RGB dither.
+    bool color_km = false;
 };
 
 // The concrete 1-based filament ids this scene paints with: the explicit `filaments` list, or -- when
