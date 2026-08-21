@@ -424,26 +424,48 @@ static std::vector<PrintMan::ShaderParam> read_shader_params(const UsdShadeShade
         if (name.rfind("printman:", 0) == 0)
             continue;   // a host directive, not a shader parameter
         const SdfValueTypeName t = in.GetTypeName();
+        using T = PrintMan::ShaderParam::Type;
         PrintMan::ShaderParam p;
         p.name = name;
+        // A 3-float value (colour/vector/point/normal), authored either single- or double-precision.
+        auto push_vec3 = [&](T ty) {
+            GfVec3f vf;
+            if (in.Get(&vf, when)) { p.type = ty; p.x = vf[0]; p.y = vf[1]; p.z = vf[2]; out.push_back(p); return; }
+            GfVec3d vd;
+            if (in.Get(&vd, when)) { p.type = ty; p.x = vd[0]; p.y = vd[1]; p.z = vd[2]; out.push_back(p); }
+        };
         if (t == SdfValueTypeNames->Float) {
             float v = 0.0f;
-            if (in.Get(&v, when)) { p.value = v; out.push_back(p); }
+            if (in.Get(&v, when)) { p.type = T::Float; p.x = v; out.push_back(p); }
         } else if (t == SdfValueTypeNames->Double) {
             double v = 0.0;
-            if (in.Get(&v, when)) { p.value = v; out.push_back(p); }
+            if (in.Get(&v, when)) { p.type = T::Float; p.x = v; out.push_back(p); }
         } else if (t == SdfValueTypeNames->Int) {
             int v = 0;
-            if (in.Get(&v, when)) { p.is_int = true; p.value = v; out.push_back(p); }
+            if (in.Get(&v, when)) { p.type = T::Int; p.x = v; out.push_back(p); }
         } else if (t == SdfValueTypeNames->Bool) {
             bool v = false;
-            if (in.Get(&v, when)) { p.is_int = true; p.value = v ? 1.0 : 0.0; out.push_back(p); }
+            if (in.Get(&v, when)) { p.type = T::Int; p.x = v ? 1.0 : 0.0; out.push_back(p); }
+        } else if (t == SdfValueTypeNames->Color3f  || t == SdfValueTypeNames->Color3d) {
+            push_vec3(T::Color);
+        } else if (t == SdfValueTypeNames->Vector3f || t == SdfValueTypeNames->Vector3d
+                   || t == SdfValueTypeNames->Float3 || t == SdfValueTypeNames->Double3) {
+            push_vec3(T::Vector);
+        } else if (t == SdfValueTypeNames->Point3f  || t == SdfValueTypeNames->Point3d) {
+            push_vec3(T::Point);
+        } else if (t == SdfValueTypeNames->Normal3f || t == SdfValueTypeNames->Normal3d) {
+            push_vec3(T::Normal);
+        } else if (t == SdfValueTypeNames->String) {
+            std::string v;
+            if (in.Get(&v, when)) { p.type = T::String; p.str = v; out.push_back(p); }
+        } else if (t == SdfValueTypeNames->Token) {
+            TfToken v;
+            if (in.Get(&v, when)) { p.type = T::String; p.str = v.GetString(); out.push_back(p); }
         } else {
             // Loudly, not silently: an unsupported type is dropped, so the author knows why their parameter
-            // did not take instead of the shader quietly keeping its default. Colour/vector/string: a follow-up.
+            // did not take instead of the shader quietly keeping its default.
             BOOST_LOG_TRIVIAL(warning) << "PrintMan: shader parameter '" << name << "' has unsupported type '"
-                << t.GetAsToken().GetString() << "'; not forwarded to OSL (float/double/int/bool only), so the "
-                   "shader keeps its .osl default for it.";
+                << t.GetAsToken().GetString() << "'; not forwarded to OSL, so the shader keeps its .osl default.";
         }
     }
     return out;

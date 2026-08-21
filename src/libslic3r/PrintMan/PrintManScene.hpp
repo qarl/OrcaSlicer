@@ -22,13 +22,16 @@ struct Placement
 
 // One authored OSL shader parameter carried from the USD material -- an `inputs:<name>` on the shader prim,
 // outside the printman: namespace (which is host directives, not shader params). Forwarded to the OSL shader
-// at load so a material can tune its shader (e.g. a grid's Pitch) instead of running on the .osl defaults.
-// v1 carries the scalar types PrintMan shaders use, float and int (bool as int); colour/string are follow-ups.
+// at load so a material can tune its shader (e.g. a grid's Pitch, or a colour) instead of running on the .osl
+// defaults. The type is kept so the value reaches OSL with the matching TypeDesc: a colour must be set as a
+// colour, not a bare float triple, or OSL rejects it. Covers the scalar, 3-float, and string types.
 struct ShaderParam
 {
-    std::string name;            // the OSL parameter name, e.g. "Pitch"
-    bool        is_int = false;  // int (or bool) parameter; else float
-    double      value  = 0.0;    // the authored value (an int parameter holds an integral value here)
+    enum class Type { Float, Int, Color, Vector, Point, Normal, String };
+    std::string name;                       // the OSL parameter name, e.g. "Pitch"
+    Type        type = Type::Float;
+    double      x = 0.0, y = 0.0, z = 0.0;   // Float/Int in x; Color/Vector/Point/Normal in x, y, z
+    std::string str;                         // String
 };
 
 // The OSL shaders of one material -- the same shape USD models shading (a `surface` and a `displacement`

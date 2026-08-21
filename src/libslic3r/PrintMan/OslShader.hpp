@@ -72,14 +72,38 @@ public:
 
         m_group = m_ss->ShaderGroupBegin("printman");
         // Authored material parameters override the shader's .osl defaults. Set BEFORE Shader() so they bind
-        // to this layer; a name the shader does not declare is ignored (it simply keeps its default).
+        // to this layer; a name the shader does not declare is ignored (it simply keeps its default). Each
+        // reaches OSL with its matching TypeDesc -- a colour set as a bare float triple would be rejected.
         for (const ShaderParam &p : params) {
-            if (p.is_int) {
-                const int v = int(p.value);
+            switch (p.type) {
+            case ShaderParam::Type::Int: {
+                const int v = int(p.x);
                 m_ss->Parameter(*m_group, p.name, OIIO::TypeDesc(OIIO::TypeDesc::INT), &v);
-            } else {
-                const float v = float(p.value);
+                break;
+            }
+            case ShaderParam::Type::Float: {
+                const float v = float(p.x);
                 m_ss->Parameter(*m_group, p.name, OIIO::TypeDesc(OIIO::TypeDesc::FLOAT), &v);
+                break;
+            }
+            case ShaderParam::Type::Color:
+            case ShaderParam::Type::Vector:
+            case ShaderParam::Type::Point:
+            case ShaderParam::Type::Normal: {
+                const float v3[3] = {float(p.x), float(p.y), float(p.z)};
+                const OIIO::TypeDesc td(OIIO::TypeDesc::FLOAT, OIIO::TypeDesc::VEC3,
+                    p.type == ShaderParam::Type::Color  ? OIIO::TypeDesc::COLOR  :
+                    p.type == ShaderParam::Type::Point  ? OIIO::TypeDesc::POINT  :
+                    p.type == ShaderParam::Type::Normal ? OIIO::TypeDesc::NORMAL :
+                                                          OIIO::TypeDesc::VECTOR);
+                m_ss->Parameter(*m_group, p.name, td, v3);
+                break;
+            }
+            case ShaderParam::Type::String: {
+                const OSL::ustring v(p.str);
+                m_ss->Parameter(*m_group, p.name, OIIO::TypeDesc(OIIO::TypeDesc::STRING), &v);
+                break;
+            }
             }
         }
         if (!m_ss->Shader(*m_group, "surface", shadername, m_layer)) {

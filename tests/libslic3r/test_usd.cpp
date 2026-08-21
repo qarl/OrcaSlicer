@@ -2815,7 +2815,7 @@ TEST_CASE("The grid shader rides bundled in a .usdz onto sphere instances", "[us
     // into the scene's shader params (the .osl defaults are finer). They are forwarded to OSL at load below.
     auto has_param = [&](const char *n, double v) {
         for (const PrintMan::ShaderParam &p : sc.osl_displacement_params)
-            if (p.name == n && ! p.is_int && std::abs(p.value - v) < 1e-6) return true;
+            if (p.name == n && p.type == PrintMan::ShaderParam::Type::Float && std::abs(p.x - v) < 1e-6) return true;
         return false;
     };
     CHECK(has_param("Pitch", 8.0));
@@ -2936,7 +2936,8 @@ TEST_CASE("An authored shader parameter reaches the OSL shader", "[usd][printman
     const std::string dir = PRINTMAN_OSL_SHADER_DIR;
     PrintMan::OslDisplaceShader def(dir, "printman_grid");
     PrintMan::OslDisplaceShader coarse(dir, "printman_grid", "Disp", "Cout",
-                                       {{"Pitch", false, 8.0}, {"Groove", false, 4.0}});
+                                       {{"Pitch", PrintMan::ShaderParam::Type::Float, 8.0},
+                                        {"Groove", PrintMan::ShaderParam::Type::Float, 4.0}});
     int differ = 0;
     for (int i = 0; i < 40; ++ i) {
         const double t = 0.3 * i;
@@ -2947,5 +2948,26 @@ TEST_CASE("An authored shader parameter reaches the OSL shader", "[usd][printman
         if (std::abs(d0 - d1) > 1e-4) ++ differ;
     }
     CHECK(differ > 0);   // the Pitch parameter changed the lattice -> it was forwarded, not defaulted
+}
+
+// A COLOUR parameter forwards too (not just scalars): printman_gradient's Bottom/Top colour inputs, set from
+// the material, change the surface colour it returns. Proves the vec3/colour TypeDesc path, not just float.
+TEST_CASE("An authored colour shader parameter reaches the OSL shader", "[usd][printman][osl][params]")
+{
+    const std::string dir = PRINTMAN_OSL_SHADER_DIR;
+    using T = PrintMan::ShaderParam::Type;
+    PrintMan::OslDisplaceShader def(dir, "printman_gradient");   // default gradient magenta -> cyan
+    PrintMan::OslDisplaceShader red(dir, "printman_gradient", "Disp", "Cout",
+                                    {{"Bottom", T::Color, 1.0, 0.0, 0.0},   // force both ends to red
+                                     {"Top",    T::Color, 1.0, 0.0, 0.0}});
+    REQUIRE(def.has_color());
+    REQUIRE(red.has_color());
+    const PrintMan::V3 p{{0.3, 0.4, 0.5}}, n{{0.0, 0.0, 1.0}};
+    const PrintMan::V3 c0 = def.color(p, n);
+    const PrintMan::V3 c1 = red.color(p, n);
+    INFO("default=(" << c0[0] << "," << c0[1] << "," << c0[2] << ")  red=(" << c1[0] << "," << c1[1] << "," << c1[2] << ")");
+    CHECK((std::abs(c0[0] - c1[0]) > 1e-4 || std::abs(c0[1] - c1[1]) > 1e-4 || std::abs(c0[2] - c1[2]) > 1e-4));
+    CHECK(c1[0] > 0.9);   // forced red: the Bottom/Top colour params reached the shader
+    CHECK(c1[1] < 0.1);
 }
 #endif // SLIC3R_OSL
